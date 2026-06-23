@@ -16,7 +16,12 @@ from server.app.utils.images import instance_masks_to_png_base64
 from server.app.utils.images import postprocess_masks, read_image
 from server.app.utils.images import semantic_mask_to_png_base64
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
 logger = logging.getLogger("sam_geo")
+logger.setLevel(logging.INFO)
 app = FastAPI(title="SAM GEO API", version="0.1.0")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 segmenter = create_segmenter(
@@ -49,9 +54,6 @@ async def segment(
     prompt: str = Form("object"),
     threshold: float = Form(0.5),
     postprocess: str | None = Form(None),
-    quad_body_open_ratio: float | None = Form(None),
-    quad_max_main_expand_ratio: float | None = Form(None),
-    quad_max_part_expand_ratio: float | None = Form(None),
     box: str | None = Form(None),
     points: str | None = Form(None),
 ) -> SegmentResponse:
@@ -91,29 +93,6 @@ async def segment(
                 0.35,
             ),
             quad_mode=quad_mode,
-            quad_body_open_ratio=parse_ratio(
-                quad_body_open_ratio,
-                "quad_body_open_ratio",
-                getattr(settings, "quad_body_open_ratio", 0.14),
-            ),
-            quad_body_erode_size=getattr(settings, "quad_body_erode_size", 3),
-            quad_max_main_expand_ratio=parse_ratio(
-                quad_max_main_expand_ratio,
-                "quad_max_main_expand_ratio",
-                getattr(settings, "quad_max_main_expand_ratio", 0.25),
-            ),
-            quad_max_part_expand_ratio=parse_ratio(
-                quad_max_part_expand_ratio,
-                "quad_max_part_expand_ratio",
-                getattr(settings, "quad_max_part_expand_ratio", 0.35),
-            ),
-            quad_min_protrusion_area=getattr(
-                settings,
-                "quad_min_protrusion_area",
-                32,
-            ),
-            quad_max_connect_gap=getattr(settings, "quad_max_connect_gap", 8),
-            quad_max_expand_ratio=getattr(settings, "quad_max_expand_ratio", 0.45),
         )
     except ValueError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -166,14 +145,6 @@ def parse_box(value: str | None) -> tuple[int, int, int, int] | None:
 def parse_threshold(value: float) -> float:
     if value < 0.0 or value > 1.0:
         raise ValueError("threshold must be between 0 and 1")
-    return float(value)
-
-
-def parse_ratio(value: float | None, name: str, default: float) -> float:
-    if value is None:
-        return float(default)
-    if value < 0.0 or value > 1.0:
-        raise ValueError(f"{name} must be between 0 and 1")
     return float(value)
 
 

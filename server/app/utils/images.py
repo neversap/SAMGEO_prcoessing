@@ -93,13 +93,6 @@ def quadify_mask(
     mask: np.ndarray,
     mode: str = "axis",
     min_area: int = 64,
-    body_open_ratio: float = 0.14,
-    body_erode_size: int = 3,
-    max_main_expand_ratio: float = 0.25,
-    max_part_expand_ratio: float = 0.35,
-    min_protrusion_area: int = 32,
-    max_connect_gap: int = 8,
-    max_expand_ratio: float = 0.45,
 ) -> np.ndarray:
     binary = mask.astype(bool).astype(np.uint8)
     if not binary.any():
@@ -117,23 +110,9 @@ def quadify_mask(
 
         component = (labels == label).astype(np.uint8)
         if mode.lower() == "rotated":
-            component_quad = quadify_component_rotated(
-                component,
-                body_open_ratio=body_open_ratio,
-                body_erode_size=body_erode_size,
-                max_main_expand_ratio=max_main_expand_ratio,
-                max_part_expand_ratio=max_part_expand_ratio,
-                min_protrusion_area=min_protrusion_area,
-                max_connect_gap=max_connect_gap,
-                max_expand_ratio=max_expand_ratio,
-            )
+            component_quad = quadify_component_rotated(component)
         elif mode.lower() == "axis":
-            component_quad = quadify_component(
-                component,
-                min_protrusion_area=min_protrusion_area,
-                max_connect_gap=max_connect_gap,
-                max_expand_ratio=max_expand_ratio,
-            )
+            component_quad = quadify_component(component)
         else:
             raise ValueError(f"unsupported quad mode: {mode}")
         output[component_quad] = 1
@@ -185,48 +164,24 @@ def quadify_component(
 
 def quadify_component_rotated(
     component: np.ndarray,
-    body_open_ratio: float = 0.14,
-    body_erode_size: int = 3,
-    max_main_expand_ratio: float = 0.25,
-    max_part_expand_ratio: float = 0.35,
-    min_protrusion_area: int = 32,
-    max_connect_gap: int = 8,
-    max_expand_ratio: float = 0.45,
 ) -> np.ndarray:
-    source_area = int(component.sum())
-    body = estimate_body_region(
-        component,
-        open_ratio=body_open_ratio,
-        erode_size=body_erode_size,
-    )
-    if not body.any():
-        body = largest_component(component)
-    if not body.any():
+    decomposition = decompose_component_by_projection(component)
+    if decomposition is None:
         return np.zeros_like(component, dtype=bool)
 
-    body_polygon, body = bounded_body_polygon(
-        component,
-        body,
-        max_main_expand_ratio=max_main_expand_ratio,
-    )
-    if body_polygon is None:
-        return quadify_component(
-            component,
-            min_protrusion_area=min_protrusion_area,
-            max_connect_gap=max_connect_gap,
-            max_expand_ratio=max_expand_ratio,
-        )
+    body_polygon, body_angle, protrusion_seed = decomposition
 
     output = np.zeros_like(component, dtype=np.uint8)
     fill_polygon(output, body_polygon)
 
-    body_angle = polygon_long_edge_angle(body_polygon)
     body_box = polygon_bbox(body_polygon)
-    residual = (component > 0) & (output == 0)
     residual_count, residual_labels, residual_stats, _ = cv2.connectedComponentsWithStats(
-        residual.astype(np.uint8),
+        protrusion_seed.astype(np.uint8),
         connectivity=8,
     )
+    min_protrusion_area = max(8, int(component.sum() * 0.015))
+    max_part_expand_ratio = 0.75
+    max_total_expand_ratio = 0.55
     for label in range(1, residual_count):
         area = int(residual_stats[label, cv2.CC_STAT_AREA])
         if area < min_protrusion_area:
@@ -243,50 +198,143 @@ def quadify_component_rotated(
             continue
 
         protrusion_box = polygon_bbox(protrusion_polygon)
-        if bbox_gap(body_box, protrusion_box) > max_connect_gap:
-            continue
-
         candidate = output.copy()
         fill_aligned_connector(candidate, body_box, protrusion_box, body_angle)
         fill_polygon(candidate, protrusion_polygon)
         added = int((candidate.astype(bool) & (component == 0)).sum())
-        max_added = int(max(source_area * max_expand_ratio, min_protrusion_area))
+        max_added = int(max(component.sum() * max_total_expand_ratio, min_protrusion_area))
         if added <= max_added:
             output = candidate
 
     return output.astype(bool)
 
 
-def bounded_body_polygon(
+def decompose_component_by_projection(
     component: np.ndarray,
-    body: np.ndarray,
-    max_main_expand_ratio: float = 0.25,
-) -> tuple[np.ndarray | None, np.ndarray]:
-    source_area = int(component.sum())
-    max_added = int(source_area * max_main_expand_ratio)
-    current = body.astype(np.uint8)
-    best_polygon = None
-    best_body = current
+) -> tuple[np.ndarray, float, np.ndarray] | None:
+    base_polygon = min_area_rect_polygon(component)
+    if base_polygon is None:
+        return None
 
-    for _ in range(4):
-        polygon = min_area_rect_polygon(current)
-        if polygon is None:
-            break
+    angle = polygon_long_edge_angle(base_polygon)
+    ys, xs = np.where(component > 0)
+    if xs.size < 3 or ys.size < 3:
+        return None
 
-        rasterized = rasterize_polygon(polygon, component.shape)
-        added = int((rasterized & (component == 0)).sum())
-        best_polygon = polygon
-        best_body = current
-        if added <= max_added:
-            return polygon, current
+    points = np.column_stack((xs, ys)).astype(np.float32)
+    center = points.mean(axis=0)
+    local_points, inverse_rotation = to_local_points(points, center, angle)
+    core_bounds = trim_sparse_projection_bounds(local_points)
+    core_polygon = local_bounds_to_polygon(core_bounds, center, inverse_rotation)
+    core_mask = rasterize_polygon(core_polygon, component.shape)
+    protrusion_seed = (component > 0) & ~core_mask
+    if not protrusion_seed.any():
+        return base_polygon, angle, protrusion_seed
 
-        kernel = np.ones((3, 3), dtype=np.uint8)
-        eroded = cv2.erode(current, kernel, iterations=1)
-        if not eroded.any():
-            break
-        current = largest_component(eroded)
+    return core_polygon, angle, protrusion_seed
 
-    return best_polygon, best_body
+
+def to_local_points(
+    points: np.ndarray,
+    center: np.ndarray,
+    angle_degrees: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    radians = np.deg2rad(angle_degrees)
+    cos_value = float(np.cos(radians))
+    sin_value = float(np.sin(radians))
+    rotation = np.array(
+        [[cos_value, sin_value], [-sin_value, cos_value]],
+        dtype=np.float32,
+    )
+    inverse_rotation = np.array(
+        [[cos_value, -sin_value], [sin_value, cos_value]],
+        dtype=np.float32,
+    )
+    return (points - center) @ rotation.T, inverse_rotation
+
+
+def trim_sparse_projection_bounds(
+    local_points: np.ndarray,
+) -> tuple[float, float, float, float]:
+    min_x, min_y = local_points.min(axis=0)
+    max_x, max_y = local_points.max(axis=0)
+    trim_x_min, trim_x_max = dense_projection_range(local_points[:, 0], local_points[:, 1])
+    trim_y_min, trim_y_max = dense_projection_range(local_points[:, 1], local_points[:, 0])
+
+    if trim_x_max > trim_x_min:
+        min_x, max_x = trim_x_min, trim_x_max
+    if trim_y_max > trim_y_min:
+        min_y, max_y = trim_y_min, trim_y_max
+    return float(min_x), float(min_y), float(max_x), float(max_y)
+
+
+def dense_projection_range(primary: np.ndarray, secondary: np.ndarray) -> tuple[float, float]:
+    span = float(primary.max() - primary.min())
+    if span < 6:
+        return float(primary.min()), float(primary.max())
+
+    bin_count = int(max(8, min(64, round(span / 2))))
+    counts, edges = np.histogram(primary, bins=bin_count)
+    nonzero = counts[counts > 0]
+    if nonzero.size == 0:
+        return float(primary.min()), float(primary.max())
+
+    threshold = max(2, int(np.percentile(nonzero, 55) * 0.45))
+    dense = counts >= threshold
+    if not dense.any():
+        return float(primary.min()), float(primary.max())
+
+    dense = close_dense_bins(dense)
+    runs = dense_runs(dense)
+    if not runs:
+        return float(primary.min()), float(primary.max())
+
+    best_start, best_end = max(
+        runs,
+        key=lambda item: counts[item[0] : item[1] + 1].sum(),
+    )
+    return float(edges[best_start]), float(edges[best_end + 1])
+
+
+def close_dense_bins(dense: np.ndarray) -> np.ndarray:
+    result = dense.copy()
+    for index in range(1, len(result) - 1):
+        if not result[index] and result[index - 1] and result[index + 1]:
+            result[index] = True
+    return result
+
+
+def dense_runs(dense: np.ndarray) -> list[tuple[int, int]]:
+    runs = []
+    start = None
+    for index, value in enumerate(dense):
+        if value and start is None:
+            start = index
+        elif not value and start is not None:
+            runs.append((start, index - 1))
+            start = None
+    if start is not None:
+        runs.append((start, len(dense) - 1))
+    return runs
+
+
+def local_bounds_to_polygon(
+    bounds: tuple[float, float, float, float],
+    center: np.ndarray,
+    inverse_rotation: np.ndarray,
+) -> np.ndarray:
+    min_x, min_y, max_x, max_y = bounds
+    local_box = np.array(
+        [
+            [min_x, min_y],
+            [max_x, min_y],
+            [max_x, max_y],
+            [min_x, max_y],
+        ],
+        dtype=np.float32,
+    )
+    polygon = local_box @ inverse_rotation.T + center
+    return np.round(polygon).astype(np.int32)
 
 
 def min_area_rect_polygon(mask: np.ndarray) -> np.ndarray | None:
@@ -652,13 +700,6 @@ def postprocess_masks(
     orthogonal_min_edge: int = 4,
     orthogonal_max_expand_ratio: float = 0.35,
     quad_mode: str = "axis",
-    quad_body_open_ratio: float = 0.14,
-    quad_body_erode_size: int = 3,
-    quad_max_main_expand_ratio: float = 0.25,
-    quad_max_part_expand_ratio: float = 0.35,
-    quad_min_protrusion_area: int = 32,
-    quad_max_connect_gap: int = 8,
-    quad_max_expand_ratio: float = 0.45,
 ) -> list[np.ndarray]:
     if mode.lower() in {"", "none", "off", "false"}:
         return [mask.astype(bool) for mask in masks]
@@ -695,13 +736,6 @@ def postprocess_masks(
                 mask,
                 mode=quad_mode,
                 min_area=min_area,
-                body_open_ratio=quad_body_open_ratio,
-                body_erode_size=quad_body_erode_size,
-                max_main_expand_ratio=quad_max_main_expand_ratio,
-                max_part_expand_ratio=quad_max_part_expand_ratio,
-                min_protrusion_area=quad_min_protrusion_area,
-                max_connect_gap=quad_max_connect_gap,
-                max_expand_ratio=quad_max_expand_ratio,
             )
             for mask in cleaned_masks
         ]
