@@ -49,6 +49,9 @@ async def segment(
     prompt: str = Form("object"),
     threshold: float = Form(0.5),
     postprocess: str | None = Form(None),
+    quad_body_open_ratio: float | None = Form(None),
+    quad_max_main_expand_ratio: float | None = Form(None),
+    quad_max_part_expand_ratio: float | None = Form(None),
     box: str | None = Form(None),
     points: str | None = Form(None),
 ) -> SegmentResponse:
@@ -88,6 +91,22 @@ async def segment(
                 0.35,
             ),
             quad_mode=quad_mode,
+            quad_body_open_ratio=parse_ratio(
+                quad_body_open_ratio,
+                "quad_body_open_ratio",
+                getattr(settings, "quad_body_open_ratio", 0.14),
+            ),
+            quad_body_erode_size=getattr(settings, "quad_body_erode_size", 3),
+            quad_max_main_expand_ratio=parse_ratio(
+                quad_max_main_expand_ratio,
+                "quad_max_main_expand_ratio",
+                getattr(settings, "quad_max_main_expand_ratio", 0.25),
+            ),
+            quad_max_part_expand_ratio=parse_ratio(
+                quad_max_part_expand_ratio,
+                "quad_max_part_expand_ratio",
+                getattr(settings, "quad_max_part_expand_ratio", 0.35),
+            ),
             quad_min_protrusion_area=getattr(
                 settings,
                 "quad_min_protrusion_area",
@@ -147,6 +166,14 @@ def parse_box(value: str | None) -> tuple[int, int, int, int] | None:
 def parse_threshold(value: float) -> float:
     if value < 0.0 or value > 1.0:
         raise ValueError("threshold must be between 0 and 1")
+    return float(value)
+
+
+def parse_ratio(value: float | None, name: str, default: float) -> float:
+    if value is None:
+        return float(default)
+    if value < 0.0 or value > 1.0:
+        raise ValueError(f"{name} must be between 0 and 1")
     return float(value)
 
 

@@ -15,6 +15,10 @@ class Settings(BaseSettings):
     orthogonal_min_edge: int = 4
     orthogonal_max_expand_ratio: float = 0.35
     quad_mode: str = "axis"
+    quad_body_open_ratio: float = 0.14
+    quad_body_erode_size: int = 3
+    quad_max_main_expand_ratio: float = 0.25
+    quad_max_part_expand_ratio: float = 0.35
     quad_min_protrusion_area: int = 32
     quad_max_connect_gap: int = 8
     quad_max_expand_ratio: float = 0.45

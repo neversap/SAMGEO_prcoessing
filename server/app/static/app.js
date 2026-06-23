@@ -6,6 +6,9 @@ const thresholdValue = document.querySelector("#thresholdValue");
 const postprocessInput = document.querySelector("#postprocessInput");
 const boxInput = document.querySelector("#boxInput");
 const pointsInput = document.querySelector("#pointsInput");
+const quadBodyOpenRatioInput = document.querySelector("#quadBodyOpenRatioInput");
+const quadMaxMainExpandRatioInput = document.querySelector("#quadMaxMainExpandRatioInput");
+const quadMaxPartExpandRatioInput = document.querySelector("#quadMaxPartExpandRatioInput");
 const runButton = document.querySelector("#runButton");
 const serviceStatus = document.querySelector("#serviceStatus");
 const imagePreview = document.querySelector("#imagePreview");
@@ -129,6 +132,9 @@ form.addEventListener("submit", async (event) => {
   body.append("prompt", promptInput.value.trim() || "object");
   body.append("threshold", thresholdInput.value);
   body.append("postprocess", postprocessInput.value);
+  body.append("quad_body_open_ratio", quadBodyOpenRatioInput.value);
+  body.append("quad_max_main_expand_ratio", quadMaxMainExpandRatioInput.value);
+  body.append("quad_max_part_expand_ratio", quadMaxPartExpandRatioInput.value);
   if (boxInput.value.trim()) {
     body.append("box", boxInput.value.trim());
   }

@@ -93,6 +93,10 @@ def quadify_mask(
     mask: np.ndarray,
     mode: str = "axis",
     min_area: int = 64,
+    body_open_ratio: float = 0.14,
+    body_erode_size: int = 3,
+    max_main_expand_ratio: float = 0.25,
+    max_part_expand_ratio: float = 0.35,
     min_protrusion_area: int = 32,
     max_connect_gap: int = 8,
     max_expand_ratio: float = 0.45,
@@ -115,6 +119,10 @@ def quadify_mask(
         if mode.lower() == "rotated":
             component_quad = quadify_component_rotated(
                 component,
+                body_open_ratio=body_open_ratio,
+                body_erode_size=body_erode_size,
+                max_main_expand_ratio=max_main_expand_ratio,
+                max_part_expand_ratio=max_part_expand_ratio,
                 min_protrusion_area=min_protrusion_area,
                 max_connect_gap=max_connect_gap,
                 max_expand_ratio=max_expand_ratio,
@@ -177,19 +185,30 @@ def quadify_component(
 
 def quadify_component_rotated(
     component: np.ndarray,
+    body_open_ratio: float = 0.14,
+    body_erode_size: int = 3,
+    max_main_expand_ratio: float = 0.25,
+    max_part_expand_ratio: float = 0.35,
     min_protrusion_area: int = 32,
     max_connect_gap: int = 8,
     max_expand_ratio: float = 0.45,
 ) -> np.ndarray:
     source_area = int(component.sum())
-    body = estimate_body_region(component)
+    body = estimate_body_region(
+        component,
+        open_ratio=body_open_ratio,
+        erode_size=body_erode_size,
+    )
     if not body.any():
         body = largest_component(component)
     if not body.any():
         return np.zeros_like(component, dtype=bool)
 
-    output = np.zeros_like(component, dtype=np.uint8)
-    body_polygon = min_area_rect_polygon(body)
+    body_polygon, body = bounded_body_polygon(
+        component,
+        body,
+        max_main_expand_ratio=max_main_expand_ratio,
+    )
     if body_polygon is None:
         return quadify_component(
             component,
@@ -197,8 +216,11 @@ def quadify_component_rotated(
             max_connect_gap=max_connect_gap,
             max_expand_ratio=max_expand_ratio,
         )
+
+    output = np.zeros_like(component, dtype=np.uint8)
     fill_polygon(output, body_polygon)
 
+    body_angle = polygon_long_edge_angle(body_polygon)
     body_box = polygon_bbox(body_polygon)
     residual = (component > 0) & (output == 0)
     residual_count, residual_labels, residual_stats, _ = cv2.connectedComponentsWithStats(
@@ -211,8 +233,13 @@ def quadify_component_rotated(
             continue
 
         protrusion = (residual_labels == label).astype(np.uint8)
-        protrusion_polygon = min_area_rect_polygon(protrusion)
+        protrusion_polygon = fixed_angle_rect_polygon(protrusion, body_angle)
         if protrusion_polygon is None:
+            continue
+        protrusion_raster = rasterize_polygon(protrusion_polygon, component.shape)
+        protrusion_added = int((protrusion_raster & (component == 0)).sum())
+        max_part_added = int(max(area * max_part_expand_ratio, min_protrusion_area))
+        if protrusion_added > max_part_added:
             continue
 
         protrusion_box = polygon_bbox(protrusion_polygon)
@@ -220,7 +247,7 @@ def quadify_component_rotated(
             continue
 
         candidate = output.copy()
-        fill_connector(candidate, body_box, protrusion_box)
+        fill_aligned_connector(candidate, body_box, protrusion_box, body_angle)
         fill_polygon(candidate, protrusion_polygon)
         added = int((candidate.astype(bool) & (component == 0)).sum())
         max_added = int(max(source_area * max_expand_ratio, min_protrusion_area))
@@ -228,6 +255,38 @@ def quadify_component_rotated(
             output = candidate
 
     return output.astype(bool)
+
+
+def bounded_body_polygon(
+    component: np.ndarray,
+    body: np.ndarray,
+    max_main_expand_ratio: float = 0.25,
+) -> tuple[np.ndarray | None, np.ndarray]:
+    source_area = int(component.sum())
+    max_added = int(source_area * max_main_expand_ratio)
+    current = body.astype(np.uint8)
+    best_polygon = None
+    best_body = current
+
+    for _ in range(4):
+        polygon = min_area_rect_polygon(current)
+        if polygon is None:
+            break
+
+        rasterized = rasterize_polygon(polygon, component.shape)
+        added = int((rasterized & (component == 0)).sum())
+        best_polygon = polygon
+        best_body = current
+        if added <= max_added:
+            return polygon, current
+
+        kernel = np.ones((3, 3), dtype=np.uint8)
+        eroded = cv2.erode(current, kernel, iterations=1)
+        if not eroded.any():
+            break
+        current = largest_component(eroded)
+
+    return best_polygon, best_body
 
 
 def min_area_rect_polygon(mask: np.ndarray) -> np.ndarray | None:
@@ -239,6 +298,56 @@ def min_area_rect_polygon(mask: np.ndarray) -> np.ndarray | None:
     rect = cv2.minAreaRect(points)
     polygon = cv2.boxPoints(rect)
     return np.round(polygon).astype(np.int32)
+
+
+def fixed_angle_rect_polygon(mask: np.ndarray, angle_degrees: float) -> np.ndarray | None:
+    ys, xs = np.where(mask > 0)
+    if xs.size < 3 or ys.size < 3:
+        return None
+
+    points = np.column_stack((xs, ys)).astype(np.float32)
+    center = points.mean(axis=0)
+    radians = np.deg2rad(angle_degrees)
+    cos_value = float(np.cos(radians))
+    sin_value = float(np.sin(radians))
+    rotation = np.array(
+        [[cos_value, sin_value], [-sin_value, cos_value]],
+        dtype=np.float32,
+    )
+    inverse_rotation = np.array(
+        [[cos_value, -sin_value], [sin_value, cos_value]],
+        dtype=np.float32,
+    )
+
+    local_points = (points - center) @ rotation.T
+    min_x, min_y = local_points.min(axis=0)
+    max_x, max_y = local_points.max(axis=0)
+    local_box = np.array(
+        [
+            [min_x, min_y],
+            [max_x, min_y],
+            [max_x, max_y],
+            [min_x, max_y],
+        ],
+        dtype=np.float32,
+    )
+    polygon = local_box @ inverse_rotation.T + center
+    return np.round(polygon).astype(np.int32)
+
+
+def polygon_long_edge_angle(polygon: np.ndarray) -> float:
+    points = polygon.astype(np.float32)
+    best_angle = 0.0
+    best_length = -1.0
+    for index, start in enumerate(points):
+        end = points[(index + 1) % points.shape[0]]
+        dx = float(end[0] - start[0])
+        dy = float(end[1] - start[1])
+        length = dx * dx + dy * dy
+        if length > best_length:
+            best_length = length
+            best_angle = float(np.rad2deg(np.arctan2(dy, dx)))
+    return best_angle
 
 
 def polygon_bbox(polygon: np.ndarray) -> tuple[int, int, int, int]:
@@ -255,14 +364,24 @@ def fill_polygon(mask: np.ndarray, polygon: np.ndarray) -> None:
     cv2.fillPoly(mask, [polygon], 1)
 
 
-def estimate_body_region(component: np.ndarray) -> np.ndarray:
+def estimate_body_region(
+    component: np.ndarray,
+    open_ratio: float = 0.08,
+    erode_size: int = 0,
+) -> np.ndarray:
     area = int(component.sum())
-    kernel_size = int(max(3, min(31, round(area**0.5 * 0.08))))
+    kernel_size = int(max(3, min(51, round(area**0.5 * open_ratio))))
     if kernel_size % 2 == 0:
         kernel_size += 1
 
     kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
     opened = cv2.morphologyEx(component.astype(np.uint8), cv2.MORPH_OPEN, kernel)
+    if opened.any() and erode_size > 0:
+        erode_kernel_size = max(1, erode_size)
+        erode_kernel = np.ones((erode_kernel_size, erode_kernel_size), dtype=np.uint8)
+        eroded = cv2.erode(opened, erode_kernel, iterations=1)
+        if eroded.any():
+            opened = eroded
     if opened.any():
         return largest_component(opened)
     return largest_component(component)
@@ -335,6 +454,21 @@ def fill_connector(
         y1, y2 = by2, ay1
 
     fill_box(mask, (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)))
+
+
+def fill_aligned_connector(
+    mask: np.ndarray,
+    body_box: tuple[int, int, int, int],
+    protrusion_box: tuple[int, int, int, int],
+    angle_degrees: float,
+) -> None:
+    connector = np.zeros_like(mask, dtype=np.uint8)
+    fill_connector(connector, body_box, protrusion_box)
+    connector_polygon = fixed_angle_rect_polygon(connector, angle_degrees)
+    if connector_polygon is None:
+        fill_connector(mask, body_box, protrusion_box)
+        return
+    fill_polygon(mask, connector_polygon)
 
 
 def complete_polygon_corners(
@@ -518,6 +652,10 @@ def postprocess_masks(
     orthogonal_min_edge: int = 4,
     orthogonal_max_expand_ratio: float = 0.35,
     quad_mode: str = "axis",
+    quad_body_open_ratio: float = 0.14,
+    quad_body_erode_size: int = 3,
+    quad_max_main_expand_ratio: float = 0.25,
+    quad_max_part_expand_ratio: float = 0.35,
     quad_min_protrusion_area: int = 32,
     quad_max_connect_gap: int = 8,
     quad_max_expand_ratio: float = 0.45,
@@ -557,6 +695,10 @@ def postprocess_masks(
                 mask,
                 mode=quad_mode,
                 min_area=min_area,
+                body_open_ratio=quad_body_open_ratio,
+                body_erode_size=quad_body_erode_size,
+                max_main_expand_ratio=quad_max_main_expand_ratio,
+                max_part_expand_ratio=quad_max_part_expand_ratio,
                 min_protrusion_area=quad_min_protrusion_area,
                 max_connect_gap=quad_max_connect_gap,
                 max_expand_ratio=quad_max_expand_ratio,
@@ -604,7 +746,7 @@ def instance_masks_to_png_base64(
             cv2.CHAIN_APPROX_SIMPLE,
         )
         border = np.zeros((height, width), dtype=np.uint8)
-        cv2.drawContours(border, contours, -1, 1, thickness=2)
+        cv2.drawContours(border, contours, -1, 1, thickness=1)
         rgba[border.astype(bool)] = border_color
 
     image = Image.fromarray(rgba, mode="RGBA")
