@@ -1,0 +1,641 @@
+import base64
+import io
+
+import cv2
+import numpy as np
+from PIL import Image
+
+
+def read_image(image_bytes: bytes) -> Image.Image:
+    return Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+
+def mask_to_png_base64(mask: np.ndarray) -> str:
+    mask_uint8 = (mask.astype(np.uint8) * 255)
+    image = Image.fromarray(mask_uint8, mode="L")
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def polygonize_mask(
+    mask: np.ndarray,
+    epsilon_ratio: float = 0.003,
+    min_area: int = 64,
+) -> np.ndarray:
+    binary = mask.astype(bool).astype(np.uint8) * 255
+    contours, _ = cv2.findContours(
+        binary,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+    if not contours:
+        return np.zeros_like(mask, dtype=bool)
+
+    output = np.zeros_like(binary, dtype=np.uint8)
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < min_area:
+            continue
+
+        perimeter = cv2.arcLength(contour, closed=True)
+        epsilon = max(1.0, epsilon_ratio * perimeter)
+        polygon = cv2.approxPolyDP(contour, epsilon, closed=True)
+        if polygon.shape[0] >= 3:
+            cv2.fillPoly(output, [polygon], 255)
+
+    return output.astype(bool)
+
+
+def orthogonalize_mask(
+    mask: np.ndarray,
+    epsilon_ratio: float = 0.003,
+    min_area: int = 64,
+    min_edge: int = 4,
+    max_expand_ratio: float = 0.35,
+) -> np.ndarray:
+    binary = mask.astype(bool)
+    if not binary.any():
+        return np.zeros_like(binary, dtype=bool)
+
+    source_area = int(binary.sum())
+    mask_uint8 = binary.astype(np.uint8) * 255
+    contours, _ = cv2.findContours(
+        mask_uint8,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+
+    output = np.zeros_like(mask_uint8, dtype=np.uint8)
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < min_area:
+            continue
+
+        perimeter = cv2.arcLength(contour, closed=True)
+        epsilon = max(1.0, epsilon_ratio * perimeter)
+        polygon = cv2.approxPolyDP(contour, epsilon, closed=True).reshape(-1, 2)
+        polygon = complete_polygon_corners(
+            polygon,
+            binary.shape,
+            binary,
+            min_edge=min_edge,
+            max_expand_ratio=max_expand_ratio,
+            source_area=source_area,
+        )
+        if polygon.shape[0] >= 3:
+            cv2.fillPoly(output, [polygon.astype(np.int32)], 255)
+
+    return (output > 0) | binary
+
+
+def quadify_mask(
+    mask: np.ndarray,
+    mode: str = "axis",
+    min_area: int = 64,
+    min_protrusion_area: int = 32,
+    max_connect_gap: int = 8,
+    max_expand_ratio: float = 0.45,
+) -> np.ndarray:
+    binary = mask.astype(bool).astype(np.uint8)
+    if not binary.any():
+        return np.zeros_like(mask, dtype=bool)
+
+    output = np.zeros_like(binary, dtype=np.uint8)
+    component_count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        binary,
+        connectivity=8,
+    )
+    for label in range(1, component_count):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area < min_area:
+            continue
+
+        component = (labels == label).astype(np.uint8)
+        if mode.lower() == "rotated":
+            component_quad = quadify_component_rotated(
+                component,
+                min_protrusion_area=min_protrusion_area,
+                max_connect_gap=max_connect_gap,
+                max_expand_ratio=max_expand_ratio,
+            )
+        elif mode.lower() == "axis":
+            component_quad = quadify_component(
+                component,
+                min_protrusion_area=min_protrusion_area,
+                max_connect_gap=max_connect_gap,
+                max_expand_ratio=max_expand_ratio,
+            )
+        else:
+            raise ValueError(f"unsupported quad mode: {mode}")
+        output[component_quad] = 1
+
+    return output.astype(bool)
+
+
+def quadify_component(
+    component: np.ndarray,
+    min_protrusion_area: int = 32,
+    max_connect_gap: int = 8,
+    max_expand_ratio: float = 0.45,
+) -> np.ndarray:
+    source_area = int(component.sum())
+    body = estimate_body_region(component)
+    body_box = mask_bbox(body)
+    if body_box is None:
+        body_box = mask_bbox(component)
+    if body_box is None:
+        return np.zeros_like(component, dtype=bool)
+
+    output = np.zeros_like(component, dtype=np.uint8)
+    fill_box(output, body_box)
+
+    residual = (component > 0) & (output == 0)
+    residual_count, residual_labels, residual_stats, _ = cv2.connectedComponentsWithStats(
+        residual.astype(np.uint8),
+        connectivity=8,
+    )
+    for label in range(1, residual_count):
+        area = int(residual_stats[label, cv2.CC_STAT_AREA])
+        if area < min_protrusion_area:
+            continue
+
+        protrusion_box = stats_bbox(residual_stats[label])
+        if bbox_gap(body_box, protrusion_box) > max_connect_gap:
+            continue
+
+        candidate = output.copy()
+        fill_connector(candidate, body_box, protrusion_box)
+        fill_box(candidate, protrusion_box)
+        added = int((candidate.astype(bool) & (component == 0)).sum())
+        max_added = int(max(source_area * max_expand_ratio, min_protrusion_area))
+        if added <= max_added:
+            output = candidate
+
+    return output.astype(bool)
+
+
+def quadify_component_rotated(
+    component: np.ndarray,
+    min_protrusion_area: int = 32,
+    max_connect_gap: int = 8,
+    max_expand_ratio: float = 0.45,
+) -> np.ndarray:
+    source_area = int(component.sum())
+    body = estimate_body_region(component)
+    if not body.any():
+        body = largest_component(component)
+    if not body.any():
+        return np.zeros_like(component, dtype=bool)
+
+    output = np.zeros_like(component, dtype=np.uint8)
+    body_polygon = min_area_rect_polygon(body)
+    if body_polygon is None:
+        return quadify_component(
+            component,
+            min_protrusion_area=min_protrusion_area,
+            max_connect_gap=max_connect_gap,
+            max_expand_ratio=max_expand_ratio,
+        )
+    fill_polygon(output, body_polygon)
+
+    body_box = polygon_bbox(body_polygon)
+    residual = (component > 0) & (output == 0)
+    residual_count, residual_labels, residual_stats, _ = cv2.connectedComponentsWithStats(
+        residual.astype(np.uint8),
+        connectivity=8,
+    )
+    for label in range(1, residual_count):
+        area = int(residual_stats[label, cv2.CC_STAT_AREA])
+        if area < min_protrusion_area:
+            continue
+
+        protrusion = (residual_labels == label).astype(np.uint8)
+        protrusion_polygon = min_area_rect_polygon(protrusion)
+        if protrusion_polygon is None:
+            continue
+
+        protrusion_box = polygon_bbox(protrusion_polygon)
+        if bbox_gap(body_box, protrusion_box) > max_connect_gap:
+            continue
+
+        candidate = output.copy()
+        fill_connector(candidate, body_box, protrusion_box)
+        fill_polygon(candidate, protrusion_polygon)
+        added = int((candidate.astype(bool) & (component == 0)).sum())
+        max_added = int(max(source_area * max_expand_ratio, min_protrusion_area))
+        if added <= max_added:
+            output = candidate
+
+    return output.astype(bool)
+
+
+def min_area_rect_polygon(mask: np.ndarray) -> np.ndarray | None:
+    ys, xs = np.where(mask > 0)
+    if xs.size < 3 or ys.size < 3:
+        return None
+
+    points = np.column_stack((xs, ys)).astype(np.float32)
+    rect = cv2.minAreaRect(points)
+    polygon = cv2.boxPoints(rect)
+    return np.round(polygon).astype(np.int32)
+
+
+def polygon_bbox(polygon: np.ndarray) -> tuple[int, int, int, int]:
+    xs = polygon[:, 0]
+    ys = polygon[:, 1]
+    return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+
+
+def fill_polygon(mask: np.ndarray, polygon: np.ndarray) -> None:
+    height, width = mask.shape
+    polygon = polygon.astype(np.int32).copy()
+    polygon[:, 0] = np.clip(polygon[:, 0], 0, width - 1)
+    polygon[:, 1] = np.clip(polygon[:, 1], 0, height - 1)
+    cv2.fillPoly(mask, [polygon], 1)
+
+
+def estimate_body_region(component: np.ndarray) -> np.ndarray:
+    area = int(component.sum())
+    kernel_size = int(max(3, min(31, round(area**0.5 * 0.08))))
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+
+    kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+    opened = cv2.morphologyEx(component.astype(np.uint8), cv2.MORPH_OPEN, kernel)
+    if opened.any():
+        return largest_component(opened)
+    return largest_component(component)
+
+
+def largest_component(mask: np.ndarray) -> np.ndarray:
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        mask.astype(np.uint8),
+        connectivity=8,
+    )
+    if count <= 1:
+        return np.zeros_like(mask, dtype=np.uint8)
+
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    label = int(np.argmax(areas) + 1)
+    return (labels == label).astype(np.uint8)
+
+
+def mask_bbox(mask: np.ndarray) -> tuple[int, int, int, int] | None:
+    ys, xs = np.where(mask > 0)
+    if xs.size == 0 or ys.size == 0:
+        return None
+    return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+
+
+def stats_bbox(stats_row: np.ndarray) -> tuple[int, int, int, int]:
+    x = int(stats_row[cv2.CC_STAT_LEFT])
+    y = int(stats_row[cv2.CC_STAT_TOP])
+    w = int(stats_row[cv2.CC_STAT_WIDTH])
+    h = int(stats_row[cv2.CC_STAT_HEIGHT])
+    return x, y, x + w - 1, y + h - 1
+
+
+def fill_box(mask: np.ndarray, box: tuple[int, int, int, int]) -> None:
+    x1, y1, x2, y2 = box
+    mask[y1 : y2 + 1, x1 : x2 + 1] = 1
+
+
+def bbox_gap(
+    first: tuple[int, int, int, int],
+    second: tuple[int, int, int, int],
+) -> int:
+    ax1, ay1, ax2, ay2 = first
+    bx1, by1, bx2, by2 = second
+    dx = max(bx1 - ax2 - 1, ax1 - bx2 - 1, 0)
+    dy = max(by1 - ay2 - 1, ay1 - by2 - 1, 0)
+    return max(dx, dy)
+
+
+def fill_connector(
+    mask: np.ndarray,
+    body_box: tuple[int, int, int, int],
+    protrusion_box: tuple[int, int, int, int],
+) -> None:
+    ax1, ay1, ax2, ay2 = body_box
+    bx1, by1, bx2, by2 = protrusion_box
+    x1 = max(min(ax1, bx1), min(max(ax1, bx1), min(ax2, bx2)))
+    x2 = min(max(ax2, bx2), max(min(ax2, bx2), max(ax1, bx1)))
+    y1 = max(min(ay1, by1), min(max(ay1, by1), min(ay2, by2)))
+    y2 = min(max(ay2, by2), max(min(ay2, by2), max(ay1, by1)))
+
+    if ax2 < bx1:
+        x1, x2 = ax2, bx1
+    elif bx2 < ax1:
+        x1, x2 = bx2, ax1
+
+    if ay2 < by1:
+        y1, y2 = ay2, by1
+    elif by2 < ay1:
+        y1, y2 = by2, ay1
+
+    fill_box(mask, (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)))
+
+
+def complete_polygon_corners(
+    polygon: np.ndarray,
+    shape: tuple[int, int],
+    source: np.ndarray,
+    min_edge: int = 4,
+    max_expand_ratio: float = 0.35,
+    source_area: int | None = None,
+) -> np.ndarray:
+    points = remove_short_edges(polygon.astype(np.int32), min_edge=min_edge)
+    if points.shape[0] < 3:
+        return polygon
+
+    source_area = int(source.sum()) if source_area is None else source_area
+    max_iterations = max(8, points.shape[0] * 3)
+    for _ in range(max_iterations):
+        edge_index = find_diagonal_edge(points, min_edge=min_edge)
+        if edge_index is None:
+            break
+
+        start = points[edge_index]
+        end = points[(edge_index + 1) % points.shape[0]]
+        corner_candidates = [
+            np.array([end[0], start[1]], dtype=np.int32),
+            np.array([start[0], end[1]], dtype=np.int32),
+        ]
+        candidate_polygons = [
+            insert_corner(points, edge_index, corner)
+            for corner in corner_candidates
+            if not np.array_equal(corner, start) and not np.array_equal(corner, end)
+        ]
+        if not candidate_polygons:
+            break
+
+        points = max(
+            candidate_polygons,
+            key=lambda item: score_fill_first_polygon(
+                item,
+                shape=shape,
+                source=source,
+                source_area=source_area,
+                max_expand_ratio=max_expand_ratio,
+            ),
+        )
+        points = remove_short_edges(points, min_edge=min_edge)
+        if points.shape[0] < 3:
+            return polygon
+
+    return points
+
+
+def find_diagonal_edge(points: np.ndarray, min_edge: int = 4) -> int | None:
+    for index, start in enumerate(points):
+        end = points[(index + 1) % points.shape[0]]
+        dx = abs(int(end[0]) - int(start[0]))
+        dy = abs(int(end[1]) - int(start[1]))
+        if dx >= min_edge and dy >= min_edge:
+            return index
+    return None
+
+
+def insert_corner(points: np.ndarray, edge_index: int, corner: np.ndarray) -> np.ndarray:
+    return np.insert(points, edge_index + 1, corner, axis=0)
+
+
+def score_fill_first_polygon(
+    polygon: np.ndarray,
+    shape: tuple[int, int],
+    source: np.ndarray,
+    source_area: int,
+    max_expand_ratio: float,
+) -> tuple[int, int, int]:
+    rasterized = rasterize_polygon(polygon, shape)
+    overlap = int((rasterized & source).sum())
+    added = int((rasterized & ~source).sum())
+    lost = source_area - overlap
+    max_added = int(source_area * max_expand_ratio)
+    expand_penalty = max(0, added - max_added)
+    return (-lost, -expand_penalty, added)
+
+
+def rasterize_polygon(polygon: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+    canvas = np.zeros(shape, dtype=np.uint8)
+    if polygon.shape[0] >= 3:
+        cv2.fillPoly(canvas, [polygon.astype(np.int32)], 1)
+    return canvas.astype(bool)
+
+
+def remove_short_edges(points: np.ndarray, min_edge: int = 4) -> np.ndarray:
+    if points.shape[0] < 4:
+        return points
+
+    kept = [points[0]]
+    for point in points[1:]:
+        previous = kept[-1]
+        length = max(abs(int(point[0]) - int(previous[0])), abs(int(point[1]) - int(previous[1])))
+        if length >= min_edge:
+            kept.append(point)
+
+    if len(kept) > 2:
+        first = kept[0]
+        last = kept[-1]
+        length = max(abs(int(first[0]) - int(last[0])), abs(int(first[1]) - int(last[1])))
+        if length < min_edge:
+            kept.pop()
+
+    return np.array(kept, dtype=np.int32)
+
+
+def clean_mask_components(
+    mask: np.ndarray,
+    min_area: int = 64,
+    max_area: int | None = None,
+    connectivity: int = 8,
+    fill_holes: bool = True,
+    max_hole_area: int = 256,
+) -> np.ndarray:
+    connectivity = 8 if connectivity == 8 else 4
+    binary = mask.astype(bool).astype(np.uint8)
+    label_count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        binary,
+        connectivity=connectivity,
+    )
+
+    cleaned = np.zeros_like(binary, dtype=np.uint8)
+    for label in range(1, label_count):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area < min_area:
+            continue
+        if max_area is not None and area > max_area:
+            continue
+        cleaned[labels == label] = 1
+
+    if fill_holes and cleaned.any():
+        cleaned = fill_small_holes(
+            cleaned,
+            connectivity=connectivity,
+            max_hole_area=max_hole_area,
+        )
+
+    return cleaned.astype(bool)
+
+
+def fill_small_holes(
+    mask: np.ndarray,
+    connectivity: int = 8,
+    max_hole_area: int = 256,
+) -> np.ndarray:
+    binary = mask.astype(bool).astype(np.uint8)
+    inverse = (binary == 0).astype(np.uint8)
+    label_count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        inverse,
+        connectivity=connectivity,
+    )
+
+    height, width = binary.shape
+    filled = binary.copy()
+    for label in range(1, label_count):
+        x = int(stats[label, cv2.CC_STAT_LEFT])
+        y = int(stats[label, cv2.CC_STAT_TOP])
+        w = int(stats[label, cv2.CC_STAT_WIDTH])
+        h = int(stats[label, cv2.CC_STAT_HEIGHT])
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        touches_border = x == 0 or y == 0 or x + w >= width or y + h >= height
+        if not touches_border and area <= max_hole_area:
+            filled[labels == label] = 1
+
+    return filled
+
+
+def postprocess_masks(
+    masks: list[np.ndarray],
+    mode: str = "polygon",
+    epsilon_ratio: float = 0.003,
+    min_area: int = 64,
+    max_area: int | None = None,
+    fill_holes: bool = True,
+    max_hole_area: int = 256,
+    connectivity: int = 8,
+    orthogonal_min_edge: int = 4,
+    orthogonal_max_expand_ratio: float = 0.35,
+    quad_mode: str = "axis",
+    quad_min_protrusion_area: int = 32,
+    quad_max_connect_gap: int = 8,
+    quad_max_expand_ratio: float = 0.45,
+) -> list[np.ndarray]:
+    if mode.lower() in {"", "none", "off", "false"}:
+        return [mask.astype(bool) for mask in masks]
+    if mode.lower() not in {"clean", "polygon", "orthogonal", "quad"}:
+        raise ValueError(f"unsupported mask postprocess mode: {mode}")
+
+    cleaned_masks = [
+        clean_mask_components(
+            mask,
+            min_area=min_area,
+            max_area=max_area,
+            connectivity=connectivity,
+            fill_holes=fill_holes,
+            max_hole_area=max_hole_area,
+        )
+        for mask in masks
+    ]
+    if mode.lower() == "clean":
+        return cleaned_masks
+    if mode.lower() == "orthogonal":
+        return [
+            orthogonalize_mask(
+                mask,
+                epsilon_ratio=epsilon_ratio,
+                min_area=min_area,
+                min_edge=orthogonal_min_edge,
+                max_expand_ratio=orthogonal_max_expand_ratio,
+            )
+            for mask in cleaned_masks
+        ]
+    if mode.lower() == "quad":
+        return [
+            quadify_mask(
+                mask,
+                mode=quad_mode,
+                min_area=min_area,
+                min_protrusion_area=quad_min_protrusion_area,
+                max_connect_gap=quad_max_connect_gap,
+                max_expand_ratio=quad_max_expand_ratio,
+            )
+            for mask in cleaned_masks
+        ]
+    return [
+        polygonize_mask(mask, epsilon_ratio=epsilon_ratio, min_area=min_area)
+        for mask in cleaned_masks
+    ]
+
+
+def semantic_mask_to_png_base64(
+    masks: list[np.ndarray],
+    width: int = 1,
+    height: int = 1,
+) -> str:
+    if not masks:
+        return mask_to_png_base64(np.zeros((height, width), dtype=bool))
+    semantic = np.zeros_like(masks[0], dtype=bool)
+    for mask in masks:
+        semantic |= mask.astype(bool)
+    return mask_to_png_base64(semantic)
+
+
+def instance_masks_to_png_base64(
+    masks: list[np.ndarray],
+    width: int = 1,
+    height: int = 1,
+) -> str:
+    if not masks:
+        return transparent_png_base64(width, height)
+
+    height, width = masks[0].shape
+    rgba = np.zeros((height, width, 4), dtype=np.uint8)
+    fill_color = np.array((248, 113, 113, 90), dtype=np.uint8)
+    border_color = np.array((127, 29, 29, 230), dtype=np.uint8)
+    for mask in masks:
+        mask_bool = mask.astype(bool)
+        rgba[mask_bool] = fill_color
+
+        contours, _ = cv2.findContours(
+            mask_bool.astype(np.uint8),
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+        border = np.zeros((height, width), dtype=np.uint8)
+        cv2.drawContours(border, contours, -1, 1, thickness=2)
+        rgba[border.astype(bool)] = border_color
+
+    image = Image.fromarray(rgba, mode="RGBA")
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def transparent_png_base64(width: int, height: int) -> str:
+    image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def instance_color(index: int) -> tuple[int, int, int, int]:
+    palette = [
+        (20, 184, 166, 150),
+        (245, 158, 11, 150),
+        (37, 99, 235, 150),
+        (225, 29, 72, 150),
+        (132, 204, 22, 150),
+        (14, 165, 233, 150),
+        (168, 85, 247, 150),
+        (249, 115, 22, 150),
+    ]
+    return palette[index % len(palette)]
+
+
+def bbox_from_mask(mask: np.ndarray) -> list[int]:
+    ys, xs = np.where(mask > 0)
+    if xs.size == 0 or ys.size == 0:
+        return [0, 0, 0, 0]
+    return [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]

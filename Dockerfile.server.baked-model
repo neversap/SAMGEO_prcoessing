@@ -1,0 +1,41 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV SAM_GEO_MODEL_DIR=/models/sam3
+
+ARG PYTORCH_INDEX_URL=https://download.pytorch.org/whl/cu128
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libgl1 \
+        libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements-server.txt /app/requirements-server.txt
+RUN pip install -r /app/requirements-server.txt
+
+RUN pip install \
+      torch==2.10.0 \
+      torchvision \
+      --index-url ${PYTORCH_INDEX_URL}
+
+COPY sam3-main.zip /tmp/sam3-main.zip
+RUN python -m zipfile -e /tmp/sam3-main.zip /opt \
+    && pip install "/opt/sam3-main[notebooks]" \
+    && rm /tmp/sam3-main.zip
+
+COPY server /app/server
+
+# This uses Docker BuildKit named contexts so the model folder does not have to
+# live inside the git repo or normal Docker build context.
+# Example:
+#   docker buildx build --build-context sam3_model=/srv/models/sam3 \
+#     -f Dockerfile.server.baked-model -t sam-geo-api:sam3 .
+COPY --from=sam3_model / /models/sam3
+
+EXPOSE 8000
+
+CMD ["python", "-m", "server.app.main"]

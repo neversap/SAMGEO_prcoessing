@@ -1,0 +1,15 @@
+# SAM3 package dependencies are intentionally not duplicated here.
+#
+# Dockerfile.server and Dockerfile.server.baked-model install sam3-main.zip
+# directly with:
+#
+#   pip install "/opt/sam3-main[notebooks]"
+#
+# That makes pip resolve dependencies and notebook extras from
+# sam3-main/pyproject.toml, keeping the image aligned with the official package
+# metadata. The image API imports einops through this extra.
+#
+# PyTorch is not listed in the SAM3 pyproject dependencies. The Dockerfiles
+# install the official SAM3 README requirement before installing sam3-main.zip:
+#
+#   pip install torch==2.10.0 torchvision --index-url https://download.pytorch.org/whl/cu128

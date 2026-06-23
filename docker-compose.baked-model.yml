@@ -1,0 +1,16 @@
+services:
+  sam-geo-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.server.baked-model
+      additional_contexts:
+        sam3_model: ${SAM_GEO_MODEL_HOST_PATH:-./models/sam3}
+    env_file:
+      - .env
+    environment:
+      SAM_GEO_BACKEND: ${SAM_GEO_BACKEND:-sam3}
+      SAM_GEO_MODEL_DIR: /models/sam3
+    ports:
+      - "${SAM_GEO_HOST_PORT:-8080}:${SAM_GEO_PORT:-8000}"
+    gpus: all
+    restart: unless-stopped

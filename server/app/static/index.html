@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SAM GEO</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="workspace">
+        <aside class="controls">
+          <div class="brand">
+            <span class="brand-mark"></span>
+            <div>
+              <h1>SAM GEO</h1>
+              <p id="serviceStatus">Checking service</p>
+            </div>
+          </div>
+
+          <form id="segmentForm" class="form">
+            <label class="field">
+              <span>Image</span>
+              <input id="imageInput" name="image" type="file" accept="image/*" required />
+            </label>
+
+            <label class="field">
+              <span>Prompt</span>
+              <input id="promptInput" name="prompt" type="text" value="building" autocomplete="off" required />
+            </label>
+
+            <label class="field threshold-field">
+              <span>Threshold <strong id="thresholdValue">0.50</strong></span>
+              <input id="thresholdInput" name="threshold" type="range" min="0" max="1" step="0.01" value="0.5" />
+            </label>
+
+            <label class="field">
+              <span>Mask postprocess</span>
+              <select id="postprocessInput" name="postprocess">
+                <option value="polygon">Polygon</option>
+                <option value="quad_rotated">Quad + rotated</option>
+              </select>
+            </label>
+
+            <details class="advanced">
+              <summary>Advanced</summary>
+              <label class="field">
+                <span>Box</span>
+                <input id="boxInput" type="text" placeholder="x1,y1,x2,y2" />
+              </label>
+              <label class="field">
+                <span>Points</span>
+                <input id="pointsInput" type="text" placeholder="[[100,120,1]]" />
+              </label>
+            </details>
+
+            <button id="runButton" type="submit">
+              <span class="button-icon">&gt;</span>
+              <span>Run segmentation</span>
+            </button>
+          </form>
+
+          <div class="result-meta">
+            <div>
+              <span>Backend</span>
+              <strong id="backendValue">-</strong>
+            </div>
+            <div>
+              <span>Objects</span>
+              <strong id="objectCountValue">-</strong>
+            </div>
+            <div>
+              <span>Top Score</span>
+              <strong id="scoreValue">-</strong>
+            </div>
+          </div>
+
+          <div class="instances-panel">
+            <span>Instances</span>
+            <div id="instancesList" class="instances-list"></div>
+          </div>
+        </aside>
+
+        <section class="viewer" aria-label="Segmentation preview">
+          <div id="dropZone" class="drop-zone">
+            <div class="empty-state">
+              <strong>Select an image</strong>
+              <span>Then enter a text prompt and run SAM3.</span>
+            </div>
+            <div id="previewStage" class="preview-stage hidden">
+              <img id="imagePreview" alt="Input preview" />
+              <img id="maskPreview" alt="Mask preview" />
+            </div>
+          </div>
+
+          <div class="viewer-toolbar">
+            <button id="showOverlay" class="toggle active" type="button">Overlay</button>
+            <button id="showImage" class="toggle" type="button">Image</button>
+            <button id="showSemantic" class="toggle" type="button">Semantic</button>
+            <button id="showInstances" class="toggle" type="button">Instances</button>
+            <a id="downloadMask" class="download disabled" download="sam-geo-instances.png">Download result</a>
+          </div>
+        </section>
+      </section>
+
+      <div id="toast" class="toast hidden" role="status"></div>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
