@@ -9,12 +9,18 @@ from fastapi.staticfiles import StaticFiles
 
 from server.app.adapters import create_segmenter
 from server.app.adapters.base import SegmentInput
-from server.app.schemas import HealthResponse, MaskResult, SegmentResponse
+from server.app.schemas import HealthResponse, MaskResult, ProposalGroupResult
+from server.app.schemas import ProposalResponse, ProposalResult, SegmentResponse
 from server.app.settings import settings
 from server.app.utils.images import bbox_from_mask, mask_to_png_base64
 from server.app.utils.images import instance_masks_to_png_base64
 from server.app.utils.images import postprocess_masks, read_image
 from server.app.utils.images import semantic_mask_to_png_base64
+from server.app.utils.proposals import edges_to_png_base64
+from server.app.utils.proposals import generate_opencv_proposals
+from server.app.utils.proposals import preprocess_to_png_base64
+from server.app.utils.proposals import Proposal
+from server.app.utils.proposals import proposals_to_png_base64
 
 logging.basicConfig(
     level=logging.INFO,
@@ -54,21 +60,71 @@ async def segment(
     prompt: str = Form("object"),
     threshold: float = Form(0.5),
     postprocess: str | None = Form(None),
+    inference_mode: str | None = Form(None),
     box: str | None = Form(None),
     points: str | None = Form(None),
+    use_opencv_proposals: bool = Form(False),
+    max_proposals: int = Form(30),
 ) -> SegmentResponse:
     image_bytes = await image.read()
     pil_image = read_image(image_bytes)
+    proposals = []
+    proposals_png_base64 = None
+    preprocess_png_base64 = None
+    edges_png_base64 = None
 
     try:
+        inference_mode, postprocess_mode, quad_mode = parse_segment_mode(
+            postprocess,
+            inference_mode,
+        )
+        should_generate_proposals = use_opencv_proposals
+        if should_generate_proposals:
+            proposals = generate_opencv_proposals(
+                pil_image,
+                max_proposals=parse_max_proposals(max_proposals),
+            )
+            edges_png_base64 = edges_to_png_base64(pil_image)
+            preprocess_png_base64 = preprocess_to_png_base64(pil_image)
+            proposals_png_base64 = proposals_to_png_base64(
+                proposals,
+                width=pil_image.width,
+                height=pil_image.height,
+            )
         payload = SegmentInput(
             image=pil_image,
             prompt=prompt,
             threshold=parse_threshold(threshold),
             box=parse_box(box),
-            points=parse_points(points),
+            points=None if inference_mode == "sam_cascade" else parse_points(points),
+            inference_mode=inference_mode,
+            proposals=[
+                {
+                    "bbox": item.bbox,
+                    "score": item.score,
+                }
+                for item in proposals
+            ],
+            max_proposals=parse_max_proposals(max_proposals),
         )
         masks = segmenter.segment(payload)
+        if inference_mode == "sam_cascade":
+            proposals = [
+                Proposal(
+                    bbox=item["bbox"],
+                    point=item["point"],
+                    score=item["score"],
+                    area=item["area"],
+                    angle=item["angle"],
+                    polygon=item["polygon"],
+                )
+                for item in payload.proposals or []
+            ]
+            proposals_png_base64 = proposals_to_png_base64(
+                proposals,
+                width=pil_image.width,
+                height=pil_image.height,
+            )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
@@ -76,7 +132,6 @@ async def segment(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     try:
-        postprocess_mode, quad_mode = parse_postprocess(postprocess)
         processed_masks = postprocess_masks(
             [item.mask for item in masks],
             mode=postprocess_mode,
@@ -130,6 +185,39 @@ async def segment(
             )
             for index, (item, mask) in enumerate(processed_results)
         ],
+        proposals_png_base64=proposals_png_base64,
+        preprocess_png_base64=preprocess_png_base64,
+        edges_png_base64=edges_png_base64,
+        proposals=serialize_proposals(proposals),
+    )
+
+
+@app.post("/proposals", response_model=ProposalResponse)
+async def proposals(
+    image: UploadFile = File(...),
+    max_proposals: int = Form(30),
+) -> ProposalResponse:
+    image_bytes = await image.read()
+    pil_image = read_image(image_bytes)
+    try:
+        generated = generate_opencv_proposals(
+            pil_image,
+            max_proposals=parse_max_proposals(max_proposals),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return ProposalResponse(
+        width=pil_image.width,
+        height=pil_image.height,
+        proposal_count=len(generated),
+        proposals_png_base64=proposals_to_png_base64(
+            generated,
+            width=pil_image.width,
+            height=pil_image.height,
+        ),
+        edges_png_base64=edges_to_png_base64(pil_image),
+        preprocess_png_base64=preprocess_to_png_base64(pil_image),
+        proposals=serialize_proposals(generated),
     )
 
 
@@ -148,16 +236,50 @@ def parse_threshold(value: float) -> float:
     return float(value)
 
 
-def parse_postprocess(value: str | None) -> tuple[str, str]:
-    if not value:
-        return settings.mask_postprocess, getattr(settings, "quad_mode", "axis")
+def parse_max_proposals(value: int) -> int:
+    if value < 1 or value > 1000:
+        raise ValueError("max_proposals must be between 1 and 1000")
+    return int(value)
 
-    normalized = value.strip().lower()
+
+def parse_segment_mode(
+    postprocess: str | None,
+    inference_mode: str | None = None,
+) -> tuple[str, str, str]:
+    normalized_inference = (inference_mode or "text").strip().lower()
+    if normalized_inference in {"", "default"}:
+        normalized_inference = "text"
+    if normalized_inference in {
+        "proposal_boxes",
+        "proposal-boxes",
+        "proposal_box_points",
+        "proposal-box-points",
+    }:
+        normalized_inference = "sam_cascade"
+    if normalized_inference not in {"text", "sam_cascade"}:
+        raise ValueError("inference_mode must be text or sam_cascade")
+    if normalized_inference == "sam_cascade":
+        return "sam_cascade", "clean", "rotated"
+
+    if not postprocess:
+        return "text", settings.mask_postprocess, getattr(settings, "quad_mode", "axis")
+
+    normalized = postprocess.strip().lower()
     if normalized == "polygon":
-        return "polygon", getattr(settings, "quad_mode", "axis")
+        return normalized_inference, "polygon", getattr(settings, "quad_mode", "axis")
     if normalized in {"quad_rotated", "quad+rotated", "quad-rotated"}:
-        return "quad", "rotated"
-    raise ValueError("postprocess must be polygon or quad_rotated")
+        return normalized_inference, "quad", "rotated"
+    if normalized in {
+        "sam_cascade",
+        "sam-cascade",
+        "proposal_boxes",
+        "proposal-boxes",
+        "proposal_box_points",
+        "proposal-box-points",
+        "proposal",
+    }:
+        return "sam_cascade", "clean", "rotated"
+    raise ValueError("postprocess must be polygon, quad_rotated, or sam_cascade")
 
 
 def parse_points(value: str | None) -> list[tuple[int, int, int]] | None:
@@ -170,6 +292,34 @@ def parse_points(value: str | None) -> list[tuple[int, int, int]] | None:
             raise ValueError("each point must be [x, y, label]")
         parsed.append((int(point[0]), int(point[1]), int(point[2])))
     return parsed
+
+
+def serialize_proposals(proposals):
+    return [
+        ProposalResult(
+            id=index + 1,
+            score=item.score,
+            bbox=item.bbox,
+            point=item.point,
+            area=item.area,
+            angle=item.angle,
+            polygon=item.polygon,
+        )
+        for index, item in enumerate(proposals)
+    ]
+
+
+def serialize_proposal_groups(groups):
+    return [
+        ProposalGroupResult(
+            id=index + 1,
+            bbox=item.bbox,
+            points=[[int(x), int(y), 1] for x, y in item.points],
+            proposal_ids=item.proposal_ids,
+            proposal_count=item.proposal_count,
+        )
+        for index, item in enumerate(groups)
+    ]
 
 
 if __name__ == "__main__":

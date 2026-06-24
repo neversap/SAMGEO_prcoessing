@@ -1,19 +1,23 @@
 import os
 import sys
+import logging
 from contextlib import contextmanager, nullcontext
 from importlib import import_module
 from pathlib import Path
 from typing import Any
 
+import cv2
 import numpy as np
 from PIL import Image
 
 from server.app.adapters.base import SegmentInput, SegmentMask, Segmenter
+from server.app.utils.images import clean_mask_components, quadify_mask
 
 
 DEFAULT_VISIBLE_DEVICES = "6,7"
 DEFAULT_ENTRYPOINT = ""
 DEFAULT_INFERENCE_DTYPE = "bfloat16"
+logger = logging.getLogger("sam_geo.sam3")
 
 
 class Sam3Segmenter(Segmenter):
@@ -96,6 +100,7 @@ class Sam3Segmenter(Segmenter):
                 checkpoint_path=checkpoint_path,
                 load_from_HF=False,
                 device=self.device,
+                enable_inst_interactivity=True,
             )
             if self.inference_dtype == "float32" and hasattr(model, "float"):
                 model = model.float()
@@ -131,6 +136,11 @@ class Sam3Segmenter(Segmenter):
 
     def segment(self, payload: SegmentInput) -> list[SegmentMask]:
         self.preload()
+        if (
+            payload.inference_mode == "sam_cascade"
+            and self._is_official_image_processor(self.model)
+        ):
+            return self._run_official_sam_cascade_predictor(payload)
         raw_output = self._run_predictor(payload)
         return self._normalize_output(raw_output)
 
@@ -198,8 +208,664 @@ class Sam3Segmenter(Segmenter):
             "prompt, box, points)."
         )
 
+    def _run_official_sam_cascade_predictor(
+        self,
+        payload: SegmentInput,
+    ) -> list[SegmentMask]:
+        if not hasattr(self.model, "_forward_grounding"):
+            raise RuntimeError(
+                "The current SAM3 processor does not expose _forward_grounding; "
+                "SAM cascade inference requires the official Meta SAM3 "
+                "image processor."
+            )
+
+        image = payload.image
+        with self._inference_context():
+            state = self.model.set_image(image)
+            if hasattr(self.model, "set_confidence_threshold"):
+                self.model.set_confidence_threshold(0.40, state=state)
+            first_output = self.model.set_text_prompt(
+                state=state,
+                prompt=payload.prompt,
+            )
+            first_masks = self._postprocess_cascade_masks(
+                self._normalize_output(first_output)
+            )
+            proposals = self._build_cascade_proposals(
+                first_masks,
+                image_width=image.width,
+                image_height=image.height,
+                max_proposals=payload.max_proposals,
+            )
+            payload.proposals = proposals
+            logger.info(
+                "SAM cascade first pass produced %d masks and selected %d boxes",
+                len(first_masks),
+                len(proposals),
+            )
+            if not proposals:
+                logger.info("SAM cascade has no valid boxes; returning first-pass masks")
+                return first_masks
+
+            boxes = [
+                self._xyxy_to_normalized_cxcywh(
+                    item["bbox"],
+                    image.width,
+                    image.height,
+                )
+                for item in proposals
+            ]
+            sam_model = getattr(self.model, "model", None)
+            if sam_model is None or not hasattr(sam_model, "_get_dummy_prompt"):
+                raise RuntimeError(
+                    "SAM3 processor does not expose the model prompt reset API "
+                    "required for cascade inference."
+                )
+            state["geometric_prompt"] = sam_model._get_dummy_prompt()
+            if "geometric_prompt" not in state:
+                raise RuntimeError(
+                    "SAM3 did not initialize geometric_prompt for cascade inference."
+                )
+            self.model.confidence_threshold = payload.threshold
+
+            box_tensor = self.torch.tensor(
+                boxes,
+                device=self.device,
+                dtype=self.torch.float32,
+            ).view(len(boxes), 1, 4)
+            box_labels = self.torch.ones(
+                (len(boxes), 1),
+                device=self.device,
+                dtype=self.torch.bool,
+            )
+            box_mask = self.torch.zeros(
+                (1, len(boxes)),
+                device=self.device,
+                dtype=self.torch.bool,
+            )
+            state["geometric_prompt"].append_boxes(box_tensor, box_labels, box_mask)
+            second_output = self.model._forward_grounding(state)
+            second_masks = self._postprocess_cascade_masks(
+                self._normalize_output(second_output)
+            )
+            second_masks = self._filter_masks_by_proposals(
+                second_masks,
+                proposals,
+            )
+            return self._merge_cascade_masks(first_masks, second_masks)
+
+    def _build_cascade_proposals(
+        self,
+        masks: list[SegmentMask],
+        image_width: int,
+        image_height: int,
+        max_proposals: int,
+        padding_pixels: int = 10,
+        mask_iou_threshold: float = 0.70,
+        duplicate_iou_threshold: float = 0.75,
+        containment_threshold: float = 0.85,
+        confidence_weight: float = 0.10,
+        area_weight: float = 0.15,
+        distance_weight: float = 0.55,
+        region_weight: float = 0.20,
+        overlap_penalty_weight: float = 0.30,
+        minimum_box_area_ratio: float = 0.001,
+        minimum_short_side_ratio: float = 0.015,
+    ) -> list[dict]:
+        image_area = max(1, image_width * image_height)
+        candidates = []
+        for item in masks:
+            cleaned = clean_mask_components(
+                item.mask,
+                min_area=64,
+                connectivity=8,
+                fill_holes=True,
+                max_hole_area=256,
+            )
+            quad_mask = quadify_mask(cleaned, mode="rotated", min_area=64)
+            if not quad_mask.any():
+                continue
+            bbox = self._quad_vertices_bbox(quad_mask)
+            if bbox is None:
+                continue
+            area = int(quad_mask.sum())
+            area_score = float((area / image_area) ** 0.5)
+            candidates.append(
+                {
+                    "mask": quad_mask,
+                    "bbox": bbox,
+                    "score": float(item.score),
+                    "area": area,
+                    "area_score": area_score,
+                }
+            )
+
+        candidates.sort(
+            key=lambda item: (
+                item["score"],
+                item["area_score"],
+            ),
+            reverse=True,
+        )
+        mask_selected = []
+        for candidate in candidates:
+            if any(
+                self._mask_iou(candidate["mask"], chosen["mask"])
+                >= mask_iou_threshold
+                for chosen in mask_selected
+            ):
+                continue
+            mask_selected.append(candidate)
+
+        prepared = []
+        for candidate in mask_selected:
+            padded_bbox = self._pad_bbox_pixels(
+                candidate["bbox"],
+                image_width=image_width,
+                image_height=image_height,
+                padding_pixels=padding_pixels,
+            )
+            if not self._is_prompt_box_size(
+                padded_bbox,
+                image_width=image_width,
+                image_height=image_height,
+                minimum_area_ratio=minimum_box_area_ratio,
+                minimum_short_side_ratio=minimum_short_side_ratio,
+            ):
+                continue
+            x1, y1, x2, y2 = padded_bbox
+            prepared.append(
+                {
+                    "bbox": padded_bbox,
+                    "point": [(x1 + x2) // 2, (y1 + y2) // 2],
+                    "score": candidate["score"],
+                    "area": candidate["area"],
+                    "angle": 0.0,
+                    "polygon": [
+                        [x1, y1],
+                        [x2, y1],
+                        [x2, y2],
+                        [x1, y2],
+                    ],
+                    "area_score": candidate["area_score"],
+                    "center_distance": self._normalized_image_center_distance(
+                        padded_bbox,
+                        image_width=image_width,
+                        image_height=image_height,
+                    ),
+                }
+            )
+
+        selected = self._select_spatially_diverse_boxes(
+            prepared,
+            max_proposals=max_proposals,
+            image_width=image_width,
+            image_height=image_height,
+            duplicate_iou_threshold=duplicate_iou_threshold,
+            containment_threshold=containment_threshold,
+            confidence_weight=confidence_weight,
+            area_weight=area_weight,
+            distance_weight=distance_weight,
+            region_weight=region_weight,
+            overlap_penalty_weight=overlap_penalty_weight,
+        )
+        prepared_regions = self._proposal_region_counts(prepared)
+        selected_regions = self._proposal_region_counts(selected)
+        for proposal in selected:
+            proposal.pop("area_score", None)
+            proposal.pop("center_distance", None)
+        logger.info(
+            "SAM cascade proposal stages: %d candidates, %d after mask NMS, "
+            "%d size-valid boxes (%s), %d selected (%s)",
+            len(candidates),
+            len(mask_selected),
+            len(prepared),
+            prepared_regions,
+            len(selected),
+            selected_regions,
+        )
+        return selected
+
+    def _filter_masks_by_proposals(
+        self,
+        masks: list[SegmentMask],
+        proposals: list[dict],
+        minimum_overlap_ratio: float = 0.30,
+    ) -> list[SegmentMask]:
+        if not proposals or not masks:
+            return masks
+        union = np.zeros_like(masks[0].mask, dtype=bool)
+        height, width = union.shape
+        for proposal in proposals:
+            x1, y1, x2, y2 = proposal["bbox"]
+            x1 = max(0, min(width, int(x1)))
+            x2 = max(0, min(width, int(x2)))
+            y1 = max(0, min(height, int(y1)))
+            y2 = max(0, min(height, int(y2)))
+            union[y1:y2, x1:x2] = True
+
+        filtered = []
+        for item in masks:
+            mask = item.mask.astype(bool)
+            area = int(mask.sum())
+            if area <= 0:
+                continue
+            overlap_ratio = int((mask & union).sum()) / area
+            if overlap_ratio >= minimum_overlap_ratio:
+                filtered.append(item)
+        logger.info(
+            "SAM cascade second pass kept %d of %d masks after spatial filtering",
+            len(filtered),
+            len(masks),
+        )
+        return filtered
+
+    def _postprocess_cascade_masks(
+        self,
+        masks: list[SegmentMask],
+        min_area: int = 64,
+    ) -> list[SegmentMask]:
+        processed = []
+        for item in masks:
+            cleaned = clean_mask_components(
+                item.mask,
+                min_area=min_area,
+                connectivity=8,
+                fill_holes=True,
+                max_hole_area=256,
+            )
+            quad_mask = quadify_mask(
+                cleaned,
+                mode="rotated",
+                min_area=min_area,
+            )
+            if not quad_mask.any():
+                continue
+            processed.append(
+                SegmentMask(
+                    mask=quad_mask,
+                    score=item.score,
+                    bbox=self._mask_bbox(quad_mask),
+                )
+            )
+        return processed
+
+    def _merge_cascade_masks(
+        self,
+        first_masks: list[SegmentMask],
+        second_masks: list[SegmentMask],
+        cross_iou_threshold: float = 0.45,
+        cross_smaller_coverage_threshold: float = 0.75,
+        second_coverage_threshold: float = 0.65,
+        second_iou_threshold: float = 0.60,
+        second_smaller_coverage_threshold: float = 0.80,
+    ) -> list[SegmentMask]:
+        deduplicated_second = []
+        for candidate in sorted(
+            second_masks,
+            key=lambda item: item.score,
+            reverse=True,
+        ):
+            if any(
+                self._masks_are_duplicate(
+                    candidate.mask,
+                    chosen.mask,
+                    iou_threshold=second_iou_threshold,
+                    smaller_coverage_threshold=(
+                        second_smaller_coverage_threshold
+                    ),
+                )
+                for chosen in deduplicated_second
+            ):
+                continue
+            deduplicated_second.append(candidate)
+
+        supplements = []
+        for candidate in deduplicated_second:
+            duplicate_first = False
+            for first in first_masks:
+                metrics = self._mask_overlap_metrics(
+                    first.mask,
+                    candidate.mask,
+                )
+                if (
+                    metrics["iou"] >= cross_iou_threshold
+                    or metrics["smaller_coverage"]
+                    >= cross_smaller_coverage_threshold
+                    or metrics["second_coverage"] >= second_coverage_threshold
+                ):
+                    duplicate_first = True
+                    break
+            if not duplicate_first:
+                supplements.append(candidate)
+
+        logger.info(
+            "SAM cascade fusion kept %d first-pass masks and %d of %d "
+            "second-pass masks",
+            len(first_masks),
+            len(supplements),
+            len(second_masks),
+        )
+        # The renderer draws later masks on top, so keep first-pass masks last.
+        return supplements + first_masks
+
+    def _masks_are_duplicate(
+        self,
+        first: np.ndarray,
+        second: np.ndarray,
+        iou_threshold: float,
+        smaller_coverage_threshold: float,
+    ) -> bool:
+        metrics = self._mask_overlap_metrics(first, second)
+        return (
+            metrics["iou"] >= iou_threshold
+            or metrics["smaller_coverage"] >= smaller_coverage_threshold
+        )
+
+    def _mask_overlap_metrics(
+        self,
+        first: np.ndarray,
+        second: np.ndarray,
+    ) -> dict[str, float]:
+        first_bool = first.astype(bool)
+        second_bool = second.astype(bool)
+        intersection = int((first_bool & second_bool).sum())
+        first_area = int(first_bool.sum())
+        second_area = int(second_bool.sum())
+        union = first_area + second_area - intersection
+        return {
+            "iou": intersection / max(1, union),
+            "smaller_coverage": intersection
+            / max(1, min(first_area, second_area)),
+            "second_coverage": intersection / max(1, second_area),
+        }
+
+    def _mask_bbox(self, mask: np.ndarray) -> list[int]:
+        ys, xs = np.where(mask > 0)
+        if xs.size == 0 or ys.size == 0:
+            return [0, 0, 0, 0]
+        return [
+            int(xs.min()),
+            int(ys.min()),
+            int(xs.max()),
+            int(ys.max()),
+        ]
+
+    def _mask_iou(self, first: np.ndarray, second: np.ndarray) -> float:
+        intersection = int((first.astype(bool) & second.astype(bool)).sum())
+        if intersection <= 0:
+            return 0.0
+        union = int((first.astype(bool) | second.astype(bool)).sum())
+        return intersection / max(1, union)
+
+    def _bbox_iou(self, first: list[int], second: list[int]) -> float:
+        ax1, ay1, ax2, ay2 = first
+        bx1, by1, bx2, by2 = second
+        intersection_width = max(0, min(ax2, bx2) - max(ax1, bx1))
+        intersection_height = max(0, min(ay2, by2) - max(ay1, by1))
+        intersection = intersection_width * intersection_height
+        if intersection <= 0:
+            return 0.0
+        first_area = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+        second_area = max(0, bx2 - bx1) * max(0, by2 - by1)
+        return intersection / max(1, first_area + second_area - intersection)
+
+    def _bbox_containment(self, first: list[int], second: list[int]) -> float:
+        ax1, ay1, ax2, ay2 = first
+        bx1, by1, bx2, by2 = second
+        intersection_width = max(0, min(ax2, bx2) - max(ax1, bx1))
+        intersection_height = max(0, min(ay2, by2) - max(ay1, by1))
+        intersection = intersection_width * intersection_height
+        if intersection <= 0:
+            return 0.0
+        smaller_area = min(
+            max(1, (ax2 - ax1) * (ay2 - ay1)),
+            max(1, (bx2 - bx1) * (by2 - by1)),
+        )
+        return intersection / smaller_area
+
+    def _quad_vertices_bbox(self, mask: np.ndarray) -> list[int] | None:
+        contours, _ = cv2.findContours(
+            mask.astype(np.uint8),
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+        vertices = [
+            contour.reshape(-1, 2)
+            for contour in contours
+            if contour.shape[0] >= 3
+        ]
+        if not vertices:
+            return None
+        points = np.concatenate(vertices, axis=0)
+        return [
+            int(points[:, 0].min()),
+            int(points[:, 1].min()),
+            int(points[:, 0].max()),
+            int(points[:, 1].max()),
+        ]
+
+    def _pad_bbox_pixels(
+        self,
+        bbox: list[int],
+        image_width: int,
+        image_height: int,
+        padding_pixels: int,
+    ) -> list[int]:
+        x1, y1, x2, y2 = bbox
+        padding = max(0, int(padding_pixels))
+        return [
+            max(0, x1 - padding),
+            max(0, y1 - padding),
+            min(image_width, x2 + padding),
+            min(image_height, y2 + padding),
+        ]
+
+    def _select_spatially_diverse_boxes(
+        self,
+        candidates: list[dict],
+        max_proposals: int,
+        image_width: int,
+        image_height: int,
+        duplicate_iou_threshold: float,
+        containment_threshold: float,
+        confidence_weight: float,
+        area_weight: float,
+        distance_weight: float,
+        region_weight: float,
+        overlap_penalty_weight: float,
+    ) -> list[dict]:
+        if not candidates:
+            return []
+
+        remaining = [dict(item) for item in candidates]
+        selected = []
+        selection_pattern = ("inner", "inner", "outer")
+        image_diagonal = max(
+            1.0,
+            float((image_width**2 + image_height**2) ** 0.5),
+        )
+
+        while remaining and len(selected) < max(1, max_proposals):
+            remaining = [
+                candidate
+                for candidate in remaining
+                if not any(
+                    self._bbox_iou(candidate["bbox"], chosen["bbox"])
+                    >= duplicate_iou_threshold
+                    or self._bbox_containment(
+                        candidate["bbox"],
+                        chosen["bbox"],
+                    )
+                    >= containment_threshold
+                    for chosen in selected
+                )
+            ]
+            if not remaining:
+                break
+
+            target_region = selection_pattern[len(selected) % len(selection_pattern)]
+            eligible_indices = [
+                index
+                for index, candidate in enumerate(remaining)
+                if self._matches_selection_region(candidate, target_region)
+            ]
+            if not eligible_indices:
+                eligible_indices = list(range(len(remaining)))
+
+            best_index = None
+            best_key = None
+            for index in eligible_indices:
+                candidate = remaining[index]
+                max_iou = 0.0
+                minimum_distance = 1.0
+                for chosen in selected:
+                    iou = self._bbox_iou(candidate["bbox"], chosen["bbox"])
+                    max_iou = max(max_iou, iou)
+                    minimum_distance = min(
+                        minimum_distance,
+                        self._bbox_center_distance(
+                            candidate["bbox"],
+                            chosen["bbox"],
+                        )
+                        / image_diagonal,
+                    )
+
+                region_score = self._region_match_score(
+                    candidate,
+                    target_region,
+                )
+                selection_score = (
+                    confidence_weight * float(candidate["score"])
+                    + area_weight * float(candidate["area_score"])
+                    + distance_weight * minimum_distance
+                    + region_weight * region_score
+                    - overlap_penalty_weight * max_iou
+                )
+                key = (
+                    selection_score,
+                    minimum_distance,
+                    candidate["area"],
+                    candidate["score"],
+                )
+                if best_key is None or key > best_key:
+                    best_key = key
+                    best_index = index
+
+            if best_index is None:
+                break
+            selected.append(remaining.pop(best_index))
+
+        return selected
+
+    def _matches_selection_region(
+        self,
+        candidate: dict,
+        target_region: str,
+    ) -> bool:
+        distance = float(candidate["center_distance"])
+        if target_region == "outer":
+            return distance > 0.60
+        return distance <= 0.60
+
+    def _region_match_score(
+        self,
+        candidate: dict,
+        target_region: str,
+    ) -> float:
+        distance = float(candidate["center_distance"])
+        if target_region == "outer":
+            return distance
+        return 1.0 - distance
+
+    def _normalized_image_center_distance(
+        self,
+        bbox: list[int],
+        image_width: int,
+        image_height: int,
+    ) -> float:
+        box_x = (bbox[0] + bbox[2]) / 2.0
+        box_y = (bbox[1] + bbox[3]) / 2.0
+        image_x = image_width / 2.0
+        image_y = image_height / 2.0
+        distance = float(
+            ((box_x - image_x) ** 2 + (box_y - image_y) ** 2) ** 0.5
+        )
+        maximum_distance = max(
+            1.0,
+            float((image_x**2 + image_y**2) ** 0.5),
+        )
+        return min(1.0, distance / maximum_distance)
+
+    def _is_prompt_box_size(
+        self,
+        bbox: list[int],
+        image_width: int,
+        image_height: int,
+        minimum_area_ratio: float,
+        minimum_short_side_ratio: float,
+    ) -> bool:
+        width = max(0, bbox[2] - bbox[0])
+        height = max(0, bbox[3] - bbox[1])
+        area_ratio = (width * height) / max(1, image_width * image_height)
+        short_side_ratio = min(width, height) / max(
+            1,
+            min(image_width, image_height),
+        )
+        return (
+            area_ratio >= minimum_area_ratio
+            and short_side_ratio >= minimum_short_side_ratio
+        )
+
+    def _proposal_region_counts(self, proposals: list[dict]) -> str:
+        counts = {"center": 0, "transition": 0, "outer": 0}
+        for proposal in proposals:
+            distance = float(proposal["center_distance"])
+            if distance <= 0.30:
+                counts["center"] += 1
+            elif distance <= 0.60:
+                counts["transition"] += 1
+            else:
+                counts["outer"] += 1
+        return (
+            f"center={counts['center']}, "
+            f"transition={counts['transition']}, "
+            f"outer={counts['outer']}"
+        )
+
+    def _bbox_center_distance(
+        self,
+        first: list[int],
+        second: list[int],
+    ) -> float:
+        first_x = (first[0] + first[2]) / 2.0
+        first_y = (first[1] + first[3]) / 2.0
+        second_x = (second[0] + second[2]) / 2.0
+        second_y = (second[1] + second[3]) / 2.0
+        return float(
+            ((first_x - second_x) ** 2 + (first_y - second_y) ** 2) ** 0.5
+        )
+
     def _is_official_image_processor(self, model: Any) -> bool:
         return hasattr(model, "set_image") and hasattr(model, "set_text_prompt")
+
+    def _xyxy_to_normalized_cxcywh(
+        self,
+        bbox: list[int],
+        width: int,
+        height: int,
+    ) -> list[float]:
+        x1, y1, x2, y2 = bbox
+        box_width = max(1.0, float(x2 - x1))
+        box_height = max(1.0, float(y2 - y1))
+        cx = float(x1) + box_width / 2.0
+        cy = float(y1) + box_height / 2.0
+        return [
+            cx / max(1.0, float(width)),
+            cy / max(1.0, float(height)),
+            box_width / max(1.0, float(width)),
+            box_height / max(1.0, float(height)),
+        ]
 
     @contextmanager
     def _inference_context(self):

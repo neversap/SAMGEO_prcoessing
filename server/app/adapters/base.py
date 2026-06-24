@@ -12,6 +12,10 @@ class SegmentInput:
     threshold: float = 0.5
     box: tuple[int, int, int, int] | None = None
     points: list[tuple[int, int, int]] | None = None
+    inference_mode: str = "text"
+    proposals: list[dict] | None = None
+    proposal_groups: list[dict] | None = None
+    max_proposals: int = 30
 
 
 @dataclass

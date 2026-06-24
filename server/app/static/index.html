@@ -35,15 +35,25 @@
             </label>
 
             <label class="field">
-              <span>Mask postprocess</span>
+              <span>Segmentation mode</span>
               <select id="postprocessInput" name="postprocess">
                 <option value="polygon">Polygon</option>
                 <option value="quad_rotated">Quad + rotated</option>
+                <option value="sam_cascade">SAM cascade (Quad → boxes + text)</option>
               </select>
             </label>
 
             <details class="advanced">
               <summary>Advanced</summary>
+              <label class="check-field">
+                <input id="proposalInput" type="checkbox" />
+                <span>OpenCV proposals</span>
+              </label>
+              <label class="field">
+                <span>Max proposals</span>
+                <input id="maxProposalsInput" type="number" min="1" max="30" step="1" value="30" />
+              </label>
+              <button id="previewProposalsButton" class="secondary-button" type="button">Preview proposals</button>
               <label class="field">
                 <span>Box</span>
                 <input id="boxInput" type="text" placeholder="x1,y1,x2,y2" />
@@ -98,6 +108,9 @@
             <button id="showImage" class="toggle" type="button">Image</button>
             <button id="showSemantic" class="toggle" type="button">Semantic</button>
             <button id="showInstances" class="toggle" type="button">Instances</button>
+            <button id="showProposals" class="toggle" type="button">Proposals</button>
+            <button id="showEdges" class="toggle" type="button">Edges</button>
+            <button id="showPreprocess" class="toggle" type="button">Preprocess</button>
             <a id="downloadMask" class="download disabled" download="sam-geo-instances.png">Download result</a>
           </div>
         </section>

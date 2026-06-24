@@ -100,6 +100,22 @@ select {
   min-height: 42px;
 }
 
+.check-field {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-top: 12px;
+  color: #344256;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.check-field input {
+  width: 16px;
+  height: 16px;
+  accent-color: #0f766e;
+}
+
 input[type="text"],
 input[type="file"],
 input[type="number"],
@@ -176,6 +192,20 @@ button,
   opacity: 0.65;
 }
 
+.secondary-button {
+  width: 100%;
+  margin-top: 12px;
+  border: 1px solid #c9d3df;
+  background: #ffffff;
+  color: #253246;
+  font-weight: 800;
+}
+
+.secondary-button:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
 .button-icon {
   font-size: 13px;
 }
@@ -241,6 +271,22 @@ button,
   height: 12px;
   margin-top: 2px;
   border-radius: 3px;
+}
+
+.proposal-swatch {
+  width: 12px;
+  height: 12px;
+  margin-top: 2px;
+  border-radius: 3px;
+  background: #2563eb;
+}
+
+.group-swatch {
+  width: 12px;
+  height: 12px;
+  margin-top: 2px;
+  border-radius: 3px;
+  background: #0f766e;
 }
 
 .viewer {
