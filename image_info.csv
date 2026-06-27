@@ -1,0 +1,2 @@
+image_name,path,width,height,count,dtype,crs,transform,bounds_left,bounds_bottom,bounds_right,bounds_top,nodata,split
+20260408-1.tif,/home/nvme1/datasets/tif/20260408-1.tif,36608,59136,3,"uint8,uint8,uint8",EPSG:4326,"[2.682209014892578e-06, 0.0, 118.61732482910156, 0.0, -2.682209014892578e-06, 29.122695922851562]",118.61732482910156,28.964080810546875,118.71551513671875,29.122695922851562,,train

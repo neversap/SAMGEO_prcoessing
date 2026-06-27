@@ -350,14 +350,7 @@ class Sam3Segmenter(Segmenter):
         mask_selected = []
         for candidate in candidates:
             if any(
-                self._mask_iou(
-                    candidate["mask"],
-                    chosen["mask"],
-                    first_bbox=candidate["bbox"],
-                    second_bbox=chosen["bbox"],
-                    first_area=candidate["area"],
-                    second_area=chosen["area"],
-                )
+                self._mask_iou(candidate["mask"], chosen["mask"])
                 >= mask_iou_threshold
                 for chosen in mask_selected
             ):
@@ -507,36 +500,16 @@ class Sam3Segmenter(Segmenter):
         second_iou_threshold: float = 0.60,
         second_smaller_coverage_threshold: float = 0.80,
     ) -> list[SegmentMask]:
-        first_metadata = [
-            {
-                "item": item,
-                "bbox": item.bbox or self._mask_bbox(item.mask),
-                "area": int(item.mask.sum()),
-            }
-            for item in first_masks
-        ]
-        second_metadata = [
-            {
-                "item": item,
-                "bbox": item.bbox or self._mask_bbox(item.mask),
-                "area": int(item.mask.sum()),
-            }
-            for item in second_masks
-        ]
         deduplicated_second = []
         for candidate in sorted(
-            second_metadata,
-            key=lambda metadata: metadata["item"].score,
+            second_masks,
+            key=lambda item: item.score,
             reverse=True,
         ):
             if any(
                 self._masks_are_duplicate(
-                    candidate["item"].mask,
-                    chosen["item"].mask,
-                    first_bbox=candidate["bbox"],
-                    second_bbox=chosen["bbox"],
-                    first_area=candidate["area"],
-                    second_area=chosen["area"],
+                    candidate.mask,
+                    chosen.mask,
                     iou_threshold=second_iou_threshold,
                     smaller_coverage_threshold=(
                         second_smaller_coverage_threshold
@@ -550,14 +523,10 @@ class Sam3Segmenter(Segmenter):
         supplements = []
         for candidate in deduplicated_second:
             duplicate_first = False
-            for first in first_metadata:
+            for first in first_masks:
                 metrics = self._mask_overlap_metrics(
-                    first["item"].mask,
-                    candidate["item"].mask,
-                    first_bbox=first["bbox"],
-                    second_bbox=candidate["bbox"],
-                    first_area=first["area"],
-                    second_area=candidate["area"],
+                    first.mask,
+                    candidate.mask,
                 )
                 if (
                     metrics["iou"] >= cross_iou_threshold
@@ -568,7 +537,7 @@ class Sam3Segmenter(Segmenter):
                     duplicate_first = True
                     break
             if not duplicate_first:
-                supplements.append(candidate["item"])
+                supplements.append(candidate)
 
         logger.info(
             "SAM cascade fusion kept %d first-pass masks and %d of %d "
@@ -584,21 +553,10 @@ class Sam3Segmenter(Segmenter):
         self,
         first: np.ndarray,
         second: np.ndarray,
-        first_bbox: list[int],
-        second_bbox: list[int],
-        first_area: int,
-        second_area: int,
         iou_threshold: float,
         smaller_coverage_threshold: float,
     ) -> bool:
-        metrics = self._mask_overlap_metrics(
-            first,
-            second,
-            first_bbox=first_bbox,
-            second_bbox=second_bbox,
-            first_area=first_area,
-            second_area=second_area,
-        )
+        metrics = self._mask_overlap_metrics(first, second)
         return (
             metrics["iou"] >= iou_threshold
             or metrics["smaller_coverage"] >= smaller_coverage_threshold
@@ -608,33 +566,12 @@ class Sam3Segmenter(Segmenter):
         self,
         first: np.ndarray,
         second: np.ndarray,
-        first_bbox: list[int] | None = None,
-        second_bbox: list[int] | None = None,
-        first_area: int | None = None,
-        second_area: int | None = None,
     ) -> dict[str, float]:
-        first_bbox = first_bbox or self._mask_bbox(first)
-        second_bbox = second_bbox or self._mask_bbox(second)
-        intersection_bounds = self._bbox_intersection_bounds(
-            first_bbox,
-            second_bbox,
-        )
-        first_area = int(first.sum()) if first_area is None else first_area
-        second_area = int(second.sum()) if second_area is None else second_area
-        if intersection_bounds is None:
-            return {
-                "iou": 0.0,
-                "smaller_coverage": 0.0,
-                "second_coverage": 0.0,
-            }
-
-        x1, y1, x2, y2 = intersection_bounds
-        intersection = int(
-            (
-                first[y1 : y2 + 1, x1 : x2 + 1].astype(bool)
-                & second[y1 : y2 + 1, x1 : x2 + 1].astype(bool)
-            ).sum()
-        )
+        first_bool = first.astype(bool)
+        second_bool = second.astype(bool)
+        intersection = int((first_bool & second_bool).sum())
+        first_area = int(first_bool.sum())
+        second_area = int(second_bool.sum())
         union = first_area + second_area - intersection
         return {
             "iou": intersection / max(1, union),
@@ -654,36 +591,12 @@ class Sam3Segmenter(Segmenter):
             int(ys.max()),
         ]
 
-    def _mask_iou(
-        self,
-        first: np.ndarray,
-        second: np.ndarray,
-        first_bbox: list[int] | None = None,
-        second_bbox: list[int] | None = None,
-        first_area: int | None = None,
-        second_area: int | None = None,
-    ) -> float:
-        return self._mask_overlap_metrics(
-            first,
-            second,
-            first_bbox=first_bbox,
-            second_bbox=second_bbox,
-            first_area=first_area,
-            second_area=second_area,
-        )["iou"]
-
-    def _bbox_intersection_bounds(
-        self,
-        first: list[int],
-        second: list[int],
-    ) -> tuple[int, int, int, int] | None:
-        x1 = max(first[0], second[0])
-        y1 = max(first[1], second[1])
-        x2 = min(first[2], second[2])
-        y2 = min(first[3], second[3])
-        if x2 < x1 or y2 < y1:
-            return None
-        return x1, y1, x2, y2
+    def _mask_iou(self, first: np.ndarray, second: np.ndarray) -> float:
+        intersection = int((first.astype(bool) & second.astype(bool)).sum())
+        if intersection <= 0:
+            return 0.0
+        union = int((first.astype(bool) | second.astype(bool)).sum())
+        return intersection / max(1, union)
 
     def _bbox_iou(self, first: list[int], second: list[int]) -> float:
         ax1, ay1, ax2, ay2 = first

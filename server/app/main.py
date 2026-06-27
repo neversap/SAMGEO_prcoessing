@@ -3,24 +3,31 @@ import logging
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from server.app.adapters import create_segmenter
 from server.app.adapters.base import SegmentInput
+from server.app.schemas import ClearProcessedDataRequest, ClearProcessedDataResponse
+from server.app.schemas import DatasetPreviewResponse, DatasetPreviewSample
 from server.app.schemas import HealthResponse, MaskResult, ProposalGroupResult
+from server.app.schemas import PreprocessJobCreateRequest, PreprocessJobListResponse
+from server.app.schemas import PreprocessJobResponse
 from server.app.schemas import ProposalResponse, ProposalResult, SegmentResponse
 from server.app.settings import settings
 from server.app.utils.images import bbox_from_mask, mask_to_png_base64
 from server.app.utils.images import instance_masks_to_png_base64
 from server.app.utils.images import postprocess_masks, read_image
 from server.app.utils.images import semantic_mask_to_png_base64
+from server.app.utils.dataset_preview import load_preview_samples
 from server.app.utils.proposals import edges_to_png_base64
 from server.app.utils.proposals import generate_opencv_proposals
 from server.app.utils.proposals import preprocess_to_png_base64
 from server.app.utils.proposals import Proposal
 from server.app.utils.proposals import proposals_to_png_base64
+from server.app.utils.preprocess_jobs import PreprocessJobManager
+from server.app.utils.preprocess_jobs import PreprocessJobRequest
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,6 +41,16 @@ segmenter = create_segmenter(
     backend=settings.backend,
     model_dir=settings.model_dir,
     device=settings.device,
+)
+data_process_allowed_roots = [
+    Path(item.strip())
+    for item in settings.data_process_allowed_roots.split(",")
+    if item.strip()
+]
+preprocess_jobs = PreprocessJobManager(
+    jobs_dir=Path(settings.data_process_jobs_dir),
+    allowed_roots=data_process_allowed_roots,
+    max_workers=settings.data_process_max_workers,
 )
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -49,9 +66,115 @@ def root() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
 
 
+@app.get("/preprocess")
+def preprocess_page() -> FileResponse:
+    return FileResponse(STATIC_DIR / "preprocess.html")
+
+
 @app.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
     return HealthResponse(status="ok", backend=segmenter.name, device=settings.device)
+
+
+@app.post("/preprocess/jobs", response_model=PreprocessJobResponse)
+def create_preprocess_job(payload: PreprocessJobCreateRequest) -> PreprocessJobResponse:
+    try:
+        state = preprocess_jobs.create_job(
+            PreprocessJobRequest(
+                dataset_dir=payload.dataset_dir,
+                tile_size=payload.tile_size,
+                overlap=payload.overlap,
+                train_ratio=payload.train_ratio,
+                val_ratio=payload.val_ratio,
+                test_ratio=payload.test_ratio,
+                seed=payload.seed,
+                all_touched=payload.all_touched,
+                drop_empty=payload.drop_empty,
+                min_patch_size=payload.min_patch_size,
+                split_strategy=payload.split_strategy,
+                test_process=payload.test_process,
+                mask_mode=payload.mask_mode,
+                boundary_width_pixels=payload.boundary_width_pixels,
+                background_keep_ratio=payload.background_keep_ratio,
+                max_ignore_ratio=payload.max_ignore_ratio,
+                black_pixel_threshold=payload.black_pixel_threshold,
+            )
+        )
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return preprocess_job_response(state)
+
+
+@app.get("/preprocess/jobs", response_model=PreprocessJobListResponse)
+def list_preprocess_jobs() -> PreprocessJobListResponse:
+    return PreprocessJobListResponse(
+        jobs=[preprocess_job_response(state) for state in preprocess_jobs.list_jobs()]
+    )
+
+
+@app.get("/preprocess/jobs/{job_id}", response_model=PreprocessJobResponse)
+def get_preprocess_job(job_id: str) -> PreprocessJobResponse:
+    state = preprocess_jobs.get_job(job_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="preprocess job not found")
+    return preprocess_job_response(state)
+
+
+@app.post("/preprocess/jobs/{job_id}/cancel", response_model=PreprocessJobResponse)
+def cancel_preprocess_job(job_id: str) -> PreprocessJobResponse:
+    state = preprocess_jobs.cancel_job(job_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="preprocess job not found")
+    return preprocess_job_response(state)
+
+
+@app.post("/preprocess/clear", response_model=ClearProcessedDataResponse)
+def clear_processed_data(payload: ClearProcessedDataRequest) -> ClearProcessedDataResponse:
+    try:
+        result = preprocess_jobs.clear_processed_data(payload.dataset_dir)
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return ClearProcessedDataResponse(
+        dataset_dir=payload.dataset_dir,
+        cleared=result["cleared"],
+        recreated=result["recreated"],
+    )
+
+
+@app.get("/preprocess/preview", response_model=DatasetPreviewResponse)
+def preview_dataset(
+    dataset_dir: str = Query(...),
+    split: str = Query("all"),
+    mode: str = Query("random"),
+    limit: int = Query(12, ge=1, le=50),
+    seed: int = Query(42),
+) -> DatasetPreviewResponse:
+    try:
+        samples = load_preview_samples(
+            dataset_dir=dataset_dir,
+            split=split,
+            mode=mode,
+            limit=limit,
+            seed=seed,
+            allowed_roots=data_process_allowed_roots,
+        )
+    except (ValueError, FileNotFoundError, ModuleNotFoundError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return DatasetPreviewResponse(
+        dataset_dir=dataset_dir,
+        split=split,
+        mode=mode,
+        count=len(samples),
+        samples=[
+            DatasetPreviewSample(
+                **item.metadata,
+                image_png_base64=item.image_png_base64,
+                mask_png_base64=item.mask_png_base64,
+                overlay_png_base64=item.overlay_png_base64,
+            )
+            for item in samples
+        ],
+    )
 
 
 @app.post("/segment", response_model=SegmentResponse)
@@ -320,6 +443,25 @@ def serialize_proposal_groups(groups):
         )
         for index, item in enumerate(groups)
     ]
+
+
+def preprocess_job_response(state) -> PreprocessJobResponse:
+    return PreprocessJobResponse(
+        job_id=state.job_id,
+        status=state.status,
+        dataset_dir=state.dataset_dir,
+        progress=state.progress,
+        stage=state.stage,
+        current=state.current,
+        total=state.total,
+        message=state.message,
+        error=state.error,
+        created_at=state.created_at,
+        updated_at=state.updated_at,
+        finished_at=state.finished_at,
+        output_paths=state.output_paths,
+        logs=state.logs,
+    )
 
 
 if __name__ == "__main__":

@@ -15,7 +15,10 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements-server.txt /app/requirements-server.txt
-RUN pip install -r /app/requirements-server.txt
+COPY requirements-data-process.txt /app/requirements-data-process.txt
+RUN pip install \
+      -r /app/requirements-server.txt \
+      -r /app/requirements-data-process.txt
 
 RUN pip install \
       torch==2.10.0 \
@@ -27,6 +30,7 @@ RUN python -m zipfile -e /tmp/sam3-main.zip /opt \
     && pip install "/opt/sam3-main[notebooks]" \
     && rm /tmp/sam3-main.zip
 
+COPY data_process_pipeline /app/data_process_pipeline
 COPY server /app/server
 
 # This uses Docker BuildKit named contexts so the model folder does not have to

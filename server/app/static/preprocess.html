@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SAM GEO Data Preprocess</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="workspace">
+        <aside class="controls">
+          <div class="brand">
+            <span class="brand-mark"></span>
+            <div>
+              <h1>SAM GEO</h1>
+              <p id="serviceStatus">Data preprocessing</p>
+            </div>
+          </div>
+
+          <a class="page-link" href="/">Segmentation page</a>
+
+          <section class="preprocess-panel">
+            <div class="panel-title">
+              <span>Data Preprocess</span>
+              <strong id="preprocessStatus">idle</strong>
+            </div>
+            <form id="preprocessForm" class="preprocess-form">
+              <label class="field">
+                <span>Dataset path</span>
+                <input id="datasetPathInput" type="text" placeholder="/home/nvme1/datasets" required />
+              </label>
+              <div class="field-grid">
+                <label class="field">
+                  <span>Tile</span>
+                  <input id="tileSizeInput" type="number" min="64" max="8192" step="64" value="512" />
+                </label>
+                <label class="field">
+                  <span>Overlap</span>
+                  <input id="overlapInput" type="number" min="0" max="4096" step="16" value="64" />
+                </label>
+              </div>
+              <div class="field-grid">
+                <label class="field">
+                  <span>Train</span>
+                  <input id="trainRatioInput" type="number" min="0" max="1" step="0.05" value="0.8" />
+                </label>
+                <label class="field">
+                  <span>Val</span>
+                  <input id="valRatioInput" type="number" min="0" max="1" step="0.05" value="0.1" />
+                </label>
+              </div>
+              <label class="field">
+                <span>Split</span>
+                <select id="splitStrategyInput">
+                  <option value="image">Image</option>
+                  <option value="patch">Patch</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>Mask mode</span>
+                <select id="maskModeInput">
+                  <option value="binary">Binary cropland</option>
+                  <option value="field_boundary_3class">Field boundary 3-class</option>
+                </select>
+              </label>
+              <div class="field-grid">
+                <label class="field">
+                  <span>Boundary px</span>
+                  <input id="boundaryWidthInput" type="number" min="0" max="32" step="1" value="2" />
+                </label>
+                <label class="field">
+                  <span>Background keep</span>
+                  <input id="backgroundKeepInput" type="number" min="0" max="1" step="0.05" value="0.2" />
+                </label>
+              </div>
+              <div class="field-grid">
+                <label class="field">
+                  <span>Max ignore</span>
+                  <input id="maxIgnoreInput" type="number" min="0" max="1" step="0.05" value="0.5" />
+                </label>
+                <label class="field">
+                  <span>Black threshold</span>
+                  <input id="blackThresholdInput" type="number" min="0" step="1" value="0" />
+                </label>
+              </div>
+              <label class="check-field">
+                <input id="dropEmptyInput" type="checkbox" />
+                <span>Limit empty/background patches</span>
+              </label>
+              <label class="check-field">
+                <input id="testProcessInput" type="checkbox" checked />
+                <span>Test process only one image</span>
+              </label>
+              <div class="preprocess-actions">
+                <button id="startPreprocessButton" class="secondary-button" type="submit">Start preprocess</button>
+                <button id="cancelPreprocessButton" class="secondary-button" type="button" disabled>Cancel</button>
+              </div>
+              <button id="clearProcessedButton" class="danger-button" type="button">Clear processed data</button>
+            </form>
+            <div class="progress-box">
+              <div class="progress-header">
+                <span id="preprocessStage">queued</span>
+                <strong id="preprocessPercent">0%</strong>
+              </div>
+              <div class="progress-track">
+                <div id="preprocessBar" class="progress-fill"></div>
+              </div>
+              <div id="preprocessMessage" class="progress-message">No job running.</div>
+              <code id="preprocessJobId" class="job-id"></code>
+            </div>
+            <div id="preprocessOutputs" class="outputs-list"></div>
+            <div id="preprocessLogs" class="job-logs"></div>
+
+            <div class="qa-panel">
+              <div class="panel-title">
+                <span>Dataset QA</span>
+                <strong id="qaCounter">0/0</strong>
+              </div>
+              <div class="field-grid">
+                <label class="field">
+                  <span>Split</span>
+                  <select id="qaSplitInput">
+                    <option value="all">All</option>
+                    <option value="train">Train</option>
+                    <option value="val">Val</option>
+                    <option value="test">Test</option>
+                  </select>
+                </label>
+                <label class="field">
+                  <span>Mode</span>
+                  <select id="qaModeInput">
+                    <option value="random">Random</option>
+                    <option value="high_cropland">High crop</option>
+                    <option value="low_cropland">Low crop</option>
+                    <option value="empty">Empty</option>
+                    <option value="boundary">Boundary</option>
+                    <option value="high_ignore">High ignore</option>
+                  </select>
+                </label>
+              </div>
+              <label class="field">
+                <span>Samples</span>
+                <input id="qaLimitInput" type="number" min="1" max="50" step="1" value="12" />
+              </label>
+              <div class="qa-actions">
+                <button id="loadQaButton" class="secondary-button" type="button">Load samples</button>
+                <button id="prevQaButton" class="secondary-button" type="button" disabled>Prev</button>
+                <button id="randomQaButton" class="secondary-button" type="button" disabled>Random</button>
+                <button id="nextQaButton" class="secondary-button" type="button" disabled>Next</button>
+              </div>
+              <div class="qa-view-actions">
+                <button id="qaOverlayButton" class="toggle active" type="button">Overlay</button>
+                <button id="qaImageButton" class="toggle" type="button">Image</button>
+                <button id="qaMaskButton" class="toggle" type="button">Mask</button>
+              </div>
+              <div id="qaMeta" class="qa-meta"></div>
+            </div>
+          </section>
+        </aside>
+
+        <section class="viewer" aria-label="Dataset preview">
+          <div id="dropZone" class="drop-zone">
+            <div class="empty-state">
+              <strong>Load QA samples</strong>
+              <span>Processed image patches and masks will appear here.</span>
+            </div>
+            <div id="previewStage" class="preview-stage hidden">
+              <img id="imagePreview" alt="Image patch preview" />
+              <img id="maskPreview" alt="Mask patch preview" />
+            </div>
+          </div>
+        </section>
+      </section>
+
+      <div id="toast" class="toast hidden" role="status"></div>
+    </main>
+
+    <script src="/static/preprocess.js"></script>
+  </body>
+</html>
