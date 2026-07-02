@@ -1,0 +1,12 @@
+paths:
+  ftw_root: /home/nvme1/datasets/ftw_datasets/data/ftw
+  metadata_csv: /home/nvme1/datasets/ftw_datasets/data/ftw/metadata/ftw_dataloader_index.csv
+  stats_json: /home/nvme1/datasets/ftw_datasets/data/ftw/metadata/ftw_dataloader_stats.json
+  output_root: /home/nvme1/datasets/ftw_datasets/outputs/ftw_rgb_unet_effb3_pretrain_logcosh_v2
+
+loss:
+  version: log_cosh_dice_v2
+  class_weights: [0.05, 0.20, 0.75]
+  ce_weight: 0.0
+  dice_weight: 0.0
+  log_cosh_dice_weight: 1.0

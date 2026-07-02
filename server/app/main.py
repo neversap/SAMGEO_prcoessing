@@ -11,16 +11,26 @@ from server.app.adapters import create_segmenter
 from server.app.adapters.base import SegmentInput
 from server.app.schemas import ClearProcessedDataRequest, ClearProcessedDataResponse
 from server.app.schemas import DatasetPreviewResponse, DatasetPreviewSample
+from server.app.schemas import FTWDownloadRequest as FTWDownloadCreateRequest
+from server.app.schemas import FTWJobResponse, FTWPreprocessRequest as FTWPreprocessCreateRequest
 from server.app.schemas import HealthResponse, MaskResult, ProposalGroupResult
 from server.app.schemas import PreprocessJobCreateRequest, PreprocessJobListResponse
 from server.app.schemas import PreprocessJobResponse
 from server.app.schemas import ProposalResponse, ProposalResult, SegmentResponse
+from server.app.schemas import TrainingAugmentPreviewResponse, TrainingAugmentPreviewSample
+from server.app.schemas import InferenceJobCreateRequest, InferenceJobResponse
+from server.app.schemas import InferenceSampleResponse, InferenceSummaryResponse
+from server.app.schemas import TrainingJobCreateRequest, TrainingJobListResponse, TrainingJobResponse
+from server.app.schemas import TrainingMetricPoint, TrainingMetricsResponse
+from server.app.schemas import TrainingIndexRequest, TrainingIndexResponse
 from server.app.settings import settings
 from server.app.utils.images import bbox_from_mask, mask_to_png_base64
 from server.app.utils.images import instance_masks_to_png_base64
 from server.app.utils.images import postprocess_masks, read_image
 from server.app.utils.images import semantic_mask_to_png_base64
 from server.app.utils.dataset_preview import load_preview_samples
+from server.app.utils.ftw_jobs import FTWDownloadRequest, FTWJobManager, FTWPreprocessRequest
+from server.app.utils.ftw_preview import load_ftw_preview_samples
 from server.app.utils.proposals import edges_to_png_base64
 from server.app.utils.proposals import generate_opencv_proposals
 from server.app.utils.proposals import preprocess_to_png_base64
@@ -28,6 +38,10 @@ from server.app.utils.proposals import Proposal
 from server.app.utils.proposals import proposals_to_png_base64
 from server.app.utils.preprocess_jobs import PreprocessJobManager
 from server.app.utils.preprocess_jobs import PreprocessJobRequest
+from server.app.utils.training_preview import build_ftw_training_index
+from server.app.utils.training_preview import load_training_augmentation_preview
+from server.app.utils.training_jobs import TrainingJobManager, TrainingJobRequest
+from server.app.utils.inference_jobs import InferenceJobManager, InferenceJobRequest
 
 logging.basicConfig(
     level=logging.INFO,
@@ -52,6 +66,21 @@ preprocess_jobs = PreprocessJobManager(
     allowed_roots=data_process_allowed_roots,
     max_workers=settings.data_process_max_workers,
 )
+ftw_jobs = FTWJobManager(
+    jobs_dir=Path(settings.data_process_jobs_dir) / "ftw",
+    allowed_roots=data_process_allowed_roots,
+    max_workers=settings.data_process_max_workers,
+)
+training_jobs = TrainingJobManager(
+    jobs_dir=Path(settings.data_process_jobs_dir) / "training",
+    allowed_roots=data_process_allowed_roots,
+    max_workers=1,
+)
+inference_jobs = InferenceJobManager(
+    jobs_dir=Path(settings.data_process_jobs_dir) / "inference",
+    allowed_roots=data_process_allowed_roots,
+    max_workers=1,
+)
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
@@ -71,9 +100,118 @@ def preprocess_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "preprocess.html")
 
 
+@app.get("/augmentation")
+def augmentation_page() -> FileResponse:
+    return FileResponse(STATIC_DIR / "augmentation.html")
+
+
+@app.get("/training")
+def training_page() -> FileResponse:
+    return FileResponse(STATIC_DIR / "training.html")
+
+
+@app.get("/inference")
+def inference_page() -> FileResponse:
+    return FileResponse(STATIC_DIR / "inference.html")
+
+
 @app.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
     return HealthResponse(status="ok", backend=segmenter.name, device=settings.device)
+
+
+@app.post("/ftw/download", response_model=FTWJobResponse)
+def create_ftw_download_job(payload: FTWDownloadCreateRequest) -> FTWJobResponse:
+    try:
+        state = ftw_jobs.create_download_job(
+            FTWDownloadRequest(
+                ftw_root=payload.ftw_root,
+                countries=[payload.countries],
+                extra_args=payload.extra_args,
+                ftw_command=payload.ftw_command,
+            )
+        )
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return ftw_job_response(state)
+
+
+@app.post("/ftw/preprocess", response_model=FTWJobResponse)
+def create_ftw_preprocess_job(payload: FTWPreprocessCreateRequest) -> FTWJobResponse:
+    try:
+        state = ftw_jobs.create_preprocess_job(
+            FTWPreprocessRequest(
+                ftw_root=payload.ftw_root,
+                output_dir=payload.output_dir,
+                metadata_dir=payload.metadata_dir,
+                manifest_path=payload.manifest_path,
+                train_ratio=payload.train_ratio,
+                val_ratio=payload.val_ratio,
+                test_ratio=payload.test_ratio,
+                seed=payload.seed,
+                use_both_windows=payload.use_both_windows,
+                max_samples=payload.max_samples,
+            )
+        )
+    except (ValueError, FileNotFoundError, ModuleNotFoundError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return ftw_job_response(state)
+
+
+@app.get("/ftw/jobs/{job_id}", response_model=FTWJobResponse)
+def get_ftw_job(job_id: str) -> FTWJobResponse:
+    state = ftw_jobs.get_job(job_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="FTW job not found")
+    return ftw_job_response(state)
+
+
+@app.post("/ftw/jobs/{job_id}/cancel", response_model=FTWJobResponse)
+def cancel_ftw_job(job_id: str) -> FTWJobResponse:
+    state = ftw_jobs.cancel_job(job_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="FTW job not found")
+    return ftw_job_response(state)
+
+
+@app.get("/ftw/preview", response_model=DatasetPreviewResponse)
+def preview_ftw_dataset(
+    ftw_root: str = Query(...),
+    country: str = Query("all"),
+    window: str = Query("window_a"),
+    mask_type: str = Query("semantic_3class"),
+    mode: str = Query("random"),
+    limit: int = Query(12, ge=1, le=50),
+    seed: int = Query(42),
+) -> DatasetPreviewResponse:
+    try:
+        samples = load_ftw_preview_samples(
+            ftw_root=ftw_root,
+            country=country,
+            window=window,
+            mask_type=mask_type,
+            mode=mode,
+            limit=limit,
+            seed=seed,
+            allowed_roots=data_process_allowed_roots,
+        )
+    except (ValueError, FileNotFoundError, ModuleNotFoundError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return DatasetPreviewResponse(
+        dataset_dir=ftw_root,
+        split=window,
+        mode=mode,
+        count=len(samples),
+        samples=[
+            DatasetPreviewSample(
+                **item.metadata,
+                image_png_base64=item.image_png_base64,
+                mask_png_base64=item.mask_png_base64,
+                overlay_png_base64=item.overlay_png_base64,
+            )
+            for item in samples
+        ],
+    )
 
 
 @app.post("/preprocess/jobs", response_model=PreprocessJobResponse)
@@ -175,6 +313,239 @@ def preview_dataset(
             for item in samples
         ],
     )
+
+
+@app.post("/training/index/ftw", response_model=TrainingIndexResponse)
+def create_training_ftw_index(payload: TrainingIndexRequest) -> TrainingIndexResponse:
+    try:
+        result = build_ftw_training_index(
+            ftw_root=payload.ftw_root,
+            metadata_dir=payload.metadata_dir,
+            country=payload.country,
+            window=payload.window,
+            mask_type=payload.mask_type,
+            train_ratio=payload.train_ratio,
+            val_ratio=payload.val_ratio,
+            test_ratio=payload.test_ratio,
+            seed=payload.seed,
+            max_samples=payload.max_samples,
+            allowed_roots=data_process_allowed_roots,
+        )
+    except (ValueError, FileNotFoundError, ModuleNotFoundError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return TrainingIndexResponse(
+        index_path=str(result.index_path),
+        stats_path=str(result.stats_path),
+        count=result.count,
+        buckets=result.buckets,
+        splits=result.splits,
+    )
+
+
+@app.get("/training/augment-preview", response_model=TrainingAugmentPreviewResponse)
+def preview_training_augmentation(
+    source: str = Query("ftw"),
+    root_path: str = Query(...),
+    country: str = Query("all"),
+    window: str = Query("window_a"),
+    mask_type: str = Query("semantic_3class"),
+    split: str = Query("all"),
+    mode: str = Query("random"),
+    limit: int = Query(6, ge=1, le=24),
+    seed: int = Query(42),
+    hflip: bool = Query(True),
+    vflip: bool = Query(True),
+    rotate90: bool = Query(True),
+    scale_jitter: float = Query(0.15, ge=0.0, le=0.5),
+    brightness: float = Query(0.12, ge=0.0, le=0.5),
+    contrast: float = Query(0.12, ge=0.0, le=0.5),
+    noise: float = Query(0.02, ge=0.0, le=0.2),
+) -> TrainingAugmentPreviewResponse:
+    try:
+        samples, stats = load_training_augmentation_preview(
+            source=source,
+            root_path=root_path,
+            country=country,
+            window=window,
+            mask_type=mask_type,
+            split=split,
+            mode=mode,
+            limit=limit,
+            seed=seed,
+            hflip=hflip,
+            vflip=vflip,
+            rotate90=rotate90,
+            scale_jitter=scale_jitter,
+            brightness=brightness,
+            contrast=contrast,
+            noise=noise,
+            allowed_roots=data_process_allowed_roots,
+        )
+    except (ValueError, FileNotFoundError, ModuleNotFoundError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return TrainingAugmentPreviewResponse(
+        source=source,
+        root_path=root_path,
+        split=split,
+        mode=mode,
+        count=len(samples),
+        stats=stats,
+        samples=[
+            TrainingAugmentPreviewSample(
+                **item.metadata,
+                image_png_base64=item.image_png_base64,
+                mask_png_base64=item.mask_png_base64,
+                overlay_png_base64=item.overlay_png_base64,
+                augmented_image_png_base64=item.augmented_image_png_base64,
+                augmented_mask_png_base64=item.augmented_mask_png_base64,
+                augmented_overlay_png_base64=item.augmented_overlay_png_base64,
+            )
+            for item in samples
+        ],
+    )
+
+
+@app.post("/training/jobs", response_model=TrainingJobResponse)
+def create_training_job(payload: TrainingJobCreateRequest) -> TrainingJobResponse:
+    try:
+        state = training_jobs.create_job(
+            TrainingJobRequest(
+                config_path=payload.config_path,
+                stage=payload.stage,
+                epochs=payload.epochs,
+                batch_size=payload.batch_size,
+                max_train_samples=payload.max_train_samples,
+                max_val_samples=payload.max_val_samples,
+                init_checkpoint=payload.init_checkpoint,
+            )
+        )
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return training_job_response(state)
+
+
+@app.get("/training/jobs", response_model=TrainingJobListResponse)
+def list_training_jobs() -> TrainingJobListResponse:
+    return TrainingJobListResponse(
+        jobs=[training_job_response(state) for state in training_jobs.list_jobs()]
+    )
+
+
+@app.get("/training/jobs/{job_id}", response_model=TrainingJobResponse)
+def get_training_job(job_id: str) -> TrainingJobResponse:
+    state = training_jobs.get_job(job_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="training job not found")
+    return training_job_response(state)
+
+
+@app.get("/training/jobs/{job_id}/metrics", response_model=TrainingMetricsResponse)
+def get_training_metrics(job_id: str) -> TrainingMetricsResponse:
+    state = training_jobs.get_job(job_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="training job not found")
+    try:
+        metrics = training_jobs.read_metrics(job_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return TrainingMetricsResponse(
+        job_id=job_id,
+        status=state.status,
+        metrics=[TrainingMetricPoint(**row) for row in metrics],
+    )
+
+
+@app.post("/training/jobs/{job_id}/cancel", response_model=TrainingJobResponse)
+def cancel_training_job(job_id: str) -> TrainingJobResponse:
+    state = training_jobs.cancel_job(job_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="training job not found")
+    return training_job_response(state)
+
+
+@app.post("/inference/jobs", response_model=InferenceJobResponse)
+def create_inference_job(payload: InferenceJobCreateRequest) -> InferenceJobResponse:
+    try:
+        state = inference_jobs.create_job(
+            InferenceJobRequest(
+                checkpoint_path=payload.checkpoint_path,
+                config_path=payload.config_path,
+                ftw_metadata_csv=payload.ftw_metadata_csv,
+                inhouse_dataset_dir=payload.inhouse_dataset_dir,
+                ftw_count=payload.ftw_count,
+                inhouse_count=payload.inhouse_count,
+                seed=payload.seed,
+            )
+        )
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return inference_job_response(state)
+
+
+@app.get("/inference/jobs/{job_id}", response_model=InferenceJobResponse)
+def get_inference_job(job_id: str) -> InferenceJobResponse:
+    state = inference_jobs.get_job(job_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="inference job not found")
+    return inference_job_response(state)
+
+
+@app.post("/inference/jobs/{job_id}/cancel", response_model=InferenceJobResponse)
+def cancel_inference_job(job_id: str) -> InferenceJobResponse:
+    state = inference_jobs.cancel_job(job_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="inference job not found")
+    return inference_job_response(state)
+
+
+@app.get("/inference/jobs/{job_id}/summary", response_model=InferenceSummaryResponse)
+def get_inference_summary(job_id: str) -> InferenceSummaryResponse:
+    state = inference_jobs.get_job(job_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="inference job not found")
+    try:
+        summary = inference_jobs.read_summary(job_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return InferenceSummaryResponse(
+        job_id=job_id,
+        status=state.status,
+        checkpoint=summary.get("checkpoint", ""),
+        config=summary.get("config", ""),
+        count=int(summary.get("count", 0)),
+        samples=[
+            InferenceSampleResponse(
+                id=int(item.get("id", 0)),
+                source=item.get("source", ""),
+                sample_id=item.get("sample_id", ""),
+                patch_name=item.get("patch_name", ""),
+                split=item.get("split", ""),
+                country=item.get("country", ""),
+                window=item.get("window", ""),
+                cropland_ratio=float(item.get("cropland_ratio", 0.0)),
+                ignore_ratio=float(item.get("ignore_ratio", 0.0)),
+                image_path=item.get("image_path", ""),
+                mask_path=item.get("mask_path", ""),
+                image_url=f"/inference/jobs/{job_id}/files/{item.get('image_png', '')}",
+                gt_url=f"/inference/jobs/{job_id}/files/{item.get('gt_png', '')}",
+                pred_url=f"/inference/jobs/{job_id}/files/{item.get('pred_png', '')}",
+                overlay_url=f"/inference/jobs/{job_id}/files/{item.get('overlay_png', '')}",
+                metrics=item.get("metrics", {}),
+            )
+            for item in summary.get("samples", [])
+        ],
+    )
+
+
+@app.get("/inference/jobs/{job_id}/files/{file_path:path}")
+def get_inference_file(job_id: str, file_path: str) -> FileResponse:
+    try:
+        path = inference_jobs.resolve_output_file(job_id, file_path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return FileResponse(path)
 
 
 @app.post("/segment", response_model=SegmentResponse)
@@ -452,6 +823,64 @@ def preprocess_job_response(state) -> PreprocessJobResponse:
         dataset_dir=state.dataset_dir,
         progress=state.progress,
         stage=state.stage,
+        current=state.current,
+        total=state.total,
+        message=state.message,
+        error=state.error,
+        created_at=state.created_at,
+        updated_at=state.updated_at,
+        finished_at=state.finished_at,
+        output_paths=state.output_paths,
+        logs=state.logs,
+    )
+
+
+def ftw_job_response(state) -> FTWJobResponse:
+    return FTWJobResponse(
+        job_id=state.job_id,
+        status=state.status,
+        job_type=state.job_type,
+        dataset_dir=state.dataset_dir,
+        progress=state.progress,
+        stage=state.stage,
+        current=state.current,
+        total=state.total,
+        message=state.message,
+        error=state.error,
+        created_at=state.created_at,
+        updated_at=state.updated_at,
+        finished_at=state.finished_at,
+        output_paths=state.output_paths,
+        logs=state.logs,
+    )
+
+
+def training_job_response(state) -> TrainingJobResponse:
+    return TrainingJobResponse(
+        job_id=state.job_id,
+        status=state.status,
+        config_path=state.config_path,
+        stage=state.stage,
+        progress=state.progress,
+        current=state.current,
+        total=state.total,
+        message=state.message,
+        error=state.error,
+        created_at=state.created_at,
+        updated_at=state.updated_at,
+        finished_at=state.finished_at,
+        output_paths=state.output_paths,
+        logs=state.logs,
+    )
+
+
+def inference_job_response(state) -> InferenceJobResponse:
+    return InferenceJobResponse(
+        job_id=state.job_id,
+        status=state.status,
+        checkpoint_path=state.checkpoint_path,
+        config_path=state.config_path,
+        progress=state.progress,
         current=state.current,
         total=state.total,
         message=state.message,

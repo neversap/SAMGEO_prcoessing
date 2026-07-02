@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SAM GEO Augmentation</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <nav class="top-nav" aria-label="Primary navigation">
+        <a class="top-nav-link" href="/">Segmentation</a>
+        <a class="top-nav-link" href="/preprocess">Preprocess</a>
+        <a class="top-nav-link active" href="/augmentation">Augmentation</a>
+        <a class="top-nav-link" href="/training">Training</a>
+        <a class="top-nav-link" href="/inference">Inference</a>
+      </nav>
+
+      <section class="workspace">
+        <aside class="controls">
+          <div class="brand">
+            <span class="brand-mark"></span>
+            <div>
+              <h1>SAM GEO</h1>
+              <p id="serviceStatus">Augmentation preview</p>
+            </div>
+          </div>
+
+          <section class="preprocess-panel">
+            <div class="panel-title">
+              <span>Dataloader</span>
+              <strong id="trainingStatus">idle</strong>
+            </div>
+
+            <form id="trainingForm" class="preprocess-form">
+              <label class="field">
+                <span>Source</span>
+                <select id="sourceInput">
+                  <option value="ftw">FTW official processed</option>
+                  <option value="inhouse">In-house processed</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>Root path</span>
+                <input id="rootPathInput" type="text" value="/home/nvme1/datasets/ftw_datasets/data/ftw" required />
+              </label>
+
+              <div id="ftwFields" class="training-source-fields">
+                <div class="field-grid">
+                  <label class="field">
+                    <span>Country</span>
+                    <input id="countryInput" type="text" value="all" />
+                  </label>
+                  <label class="field">
+                    <span>Window</span>
+                    <select id="windowInput">
+                      <option value="window_a">Window A</option>
+                      <option value="window_b">Window B</option>
+                      <option value="both">Both</option>
+                    </select>
+                  </label>
+                </div>
+                <label class="field">
+                  <span>Mask</span>
+                  <select id="maskTypeInput">
+                    <option value="semantic_3class">Semantic 3-class</option>
+                    <option value="semantic_2class">Semantic 2-class</option>
+                    <option value="instance">Instance</option>
+                  </select>
+                </label>
+                <label class="field">
+                  <span>Metadata output</span>
+                  <input id="metadataDirInput" type="text" value="/home/nvme1/datasets/ftw_datasets/data/ftw/metadata" />
+                </label>
+                <div class="field-grid">
+                  <label class="field">
+                    <span>Train</span>
+                    <input id="trainRatioInput" type="number" min="0" max="1" step="0.05" value="0.8" />
+                  </label>
+                  <label class="field">
+                    <span>Val</span>
+                    <input id="valRatioInput" type="number" min="0" max="1" step="0.05" value="0.1" />
+                  </label>
+                </div>
+                <label class="field">
+                  <span>Max index samples</span>
+                  <input id="maxIndexSamplesInput" type="number" min="0" step="100" value="0" />
+                </label>
+                <button id="buildIndexButton" class="secondary-button" type="button">Build FTW index</button>
+              </div>
+
+              <div class="field-grid">
+                <label class="field">
+                  <span>Split</span>
+                  <select id="splitInput">
+                    <option value="all">All</option>
+                    <option value="train">Train</option>
+                    <option value="val">Val</option>
+                    <option value="test">Test</option>
+                  </select>
+                </label>
+                <label class="field">
+                  <span>Mode</span>
+                  <select id="modeInput">
+                    <option value="random">Random</option>
+                    <option value="boundary">Boundary rich</option>
+                    <option value="low_fg">Low foreground</option>
+                    <option value="mid_fg">Mid foreground</option>
+                    <option value="high_fg">High foreground</option>
+                    <option value="near_background">Near background</option>
+                  </select>
+                </label>
+              </div>
+              <div class="field-grid">
+                <label class="field">
+                  <span>Samples</span>
+                  <input id="limitInput" type="number" min="1" max="24" step="1" value="6" />
+                </label>
+                <label class="field">
+                  <span>Seed</span>
+                  <input id="seedInput" type="number" step="1" value="42" />
+                </label>
+              </div>
+
+              <details class="advanced" open>
+                <summary>Augmentation</summary>
+                <label class="check-field">
+                  <input id="hflipInput" type="checkbox" checked />
+                  <span>Horizontal flip</span>
+                </label>
+                <label class="check-field">
+                  <input id="vflipInput" type="checkbox" checked />
+                  <span>Vertical flip</span>
+                </label>
+                <label class="check-field">
+                  <input id="rotateInput" type="checkbox" checked />
+                  <span>Random rotate 90</span>
+                </label>
+                <div class="field-grid">
+                  <label class="field">
+                    <span>Scale jitter</span>
+                    <input id="scaleInput" type="number" min="0" max="0.5" step="0.01" value="0.15" />
+                  </label>
+                  <label class="field">
+                    <span>Noise</span>
+                    <input id="noiseInput" type="number" min="0" max="0.2" step="0.005" value="0.02" />
+                  </label>
+                </div>
+                <div class="field-grid">
+                  <label class="field">
+                    <span>Brightness</span>
+                    <input id="brightnessInput" type="number" min="0" max="0.5" step="0.01" value="0.12" />
+                  </label>
+                  <label class="field">
+                    <span>Contrast</span>
+                    <input id="contrastInput" type="number" min="0" max="0.5" step="0.01" value="0.12" />
+                  </label>
+                </div>
+              </details>
+
+              <button id="loadAugmentButton" class="secondary-button" type="submit">Preview augmentation</button>
+            </form>
+
+            <div id="indexOutputs" class="outputs-list"></div>
+            <div id="trainingStats" class="qa-meta"></div>
+          </section>
+        </aside>
+
+        <section class="viewer training-viewer" aria-label="Training augmentation preview">
+          <div id="trainingGrid" class="training-grid">
+            <div class="empty-state">
+              <strong>Preview training samples</strong>
+              <span>Original and augmented image/mask overlays will appear here.</span>
+            </div>
+          </div>
+        </section>
+      </section>
+
+      <div id="toast" class="toast hidden" role="status"></div>
+    </main>
+
+    <script src="/static/training.js"></script>
+  </body>
+</html>

@@ -29,6 +29,25 @@ const preprocessLogs = document.querySelector("#preprocessLogs");
 const startPreprocessButton = document.querySelector("#startPreprocessButton");
 const cancelPreprocessButton = document.querySelector("#cancelPreprocessButton");
 const clearProcessedButton = document.querySelector("#clearProcessedButton");
+const ftwStatus = document.querySelector("#ftwStatus");
+const ftwStage = document.querySelector("#ftwStage");
+const ftwPercent = document.querySelector("#ftwPercent");
+const ftwBar = document.querySelector("#ftwBar");
+const ftwMessage = document.querySelector("#ftwMessage");
+const ftwJobId = document.querySelector("#ftwJobId");
+const ftwOutputs = document.querySelector("#ftwOutputs");
+const ftwLogs = document.querySelector("#ftwLogs");
+const ftwDownloadForm = document.querySelector("#ftwDownloadForm");
+const ftwRootInput = document.querySelector("#ftwRootInput");
+const ftwCountriesInput = document.querySelector("#ftwCountriesInput");
+const ftwCommandInput = document.querySelector("#ftwCommandInput");
+const ftwExtraArgsInput = document.querySelector("#ftwExtraArgsInput");
+const ftwPreviewCountryInput = document.querySelector("#ftwPreviewCountryInput");
+const ftwPreviewWindowInput = document.querySelector("#ftwPreviewWindowInput");
+const ftwPreviewMaskInput = document.querySelector("#ftwPreviewMaskInput");
+const startFtwDownloadButton = document.querySelector("#startFtwDownloadButton");
+const cancelFtwButton = document.querySelector("#cancelFtwButton");
+const qaSourceInput = document.querySelector("#qaSourceInput");
 const qaSplitInput = document.querySelector("#qaSplitInput");
 const qaModeInput = document.querySelector("#qaModeInput");
 const qaLimitInput = document.querySelector("#qaLimitInput");
@@ -43,7 +62,9 @@ const qaCounter = document.querySelector("#qaCounter");
 const qaMeta = document.querySelector("#qaMeta");
 
 let activePreprocessJobId = window.localStorage.getItem("samGeoPreprocessJobId") || "";
+let activeFtwJobId = window.localStorage.getItem("samGeoFtwJobId") || "";
 let preprocessPollTimer = 0;
+let ftwPollTimer = 0;
 let qaSamples = [];
 let qaIndex = 0;
 let qaImageObjectUrl = "";
@@ -87,6 +108,8 @@ function base64ToBlob(base64, contentType) {
 preprocessForm.addEventListener("submit", startPreprocessJob);
 cancelPreprocessButton.addEventListener("click", cancelPreprocessJob);
 clearProcessedButton.addEventListener("click", clearProcessedData);
+ftwDownloadForm.addEventListener("submit", startFtwDownloadJob);
+cancelFtwButton.addEventListener("click", cancelFtwJob);
 loadQaButton.addEventListener("click", loadQaSamples);
 prevQaButton.addEventListener("click", () => showQaSample(qaIndex - 1));
 nextQaButton.addEventListener("click", () => showQaSample(qaIndex + 1));
@@ -97,6 +120,7 @@ qaMaskButton.addEventListener("click", () => setQaViewMode("mask"));
 
 loadHealth();
 resumePreprocessJob();
+resumeFtwJob();
 
 async function startPreprocessJob(event) {
   event.preventDefault();
@@ -211,6 +235,69 @@ async function clearProcessedData() {
   }
 }
 
+async function startFtwDownloadJob(event) {
+  event.preventDefault();
+  const ftwRoot = ftwRootInput.value.trim();
+  const countries = ftwCountriesInput.value.trim();
+  if (!ftwRoot || !countries) {
+    showToast("Enter FTW root and countries.");
+    return;
+  }
+  const payload = {
+    ftw_root: ftwRoot,
+    countries,
+    ftw_command: ftwCommandInput.value.trim() || "ftw",
+    extra_args: ftwExtraArgsInput.value.trim(),
+  };
+  startFtwDownloadButton.disabled = true;
+  startFtwDownloadButton.textContent = "Starting";
+  let started = false;
+  try {
+    const response = await fetch("/ftw/download", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const job = await response.json();
+    if (!response.ok) {
+      throw new Error(job.detail || "Failed to start FTW download.");
+    }
+    activeFtwJobId = job.job_id;
+    started = true;
+    window.localStorage.setItem("samGeoFtwJobId", activeFtwJobId);
+    renderFtwJob(job);
+    pollFtwJob();
+    showToast("FTW download job started.");
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    if (!started) {
+      startFtwDownloadButton.disabled = false;
+    }
+    startFtwDownloadButton.textContent = "Download FTW";
+  }
+}
+
+async function cancelFtwJob() {
+  if (!activeFtwJobId) {
+    return;
+  }
+  cancelFtwButton.disabled = true;
+  try {
+    const response = await fetch(`/ftw/jobs/${activeFtwJobId}/cancel`, {
+      method: "POST",
+    });
+    const job = await response.json();
+    if (!response.ok) {
+      throw new Error(job.detail || "Failed to cancel FTW job.");
+    }
+    renderFtwJob(job);
+    showToast("FTW cancellation requested.");
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
 async function resumePreprocessJob() {
   if (!activePreprocessJobId) {
     return;
@@ -229,6 +316,27 @@ async function resumePreprocessJob() {
     }
   } catch (error) {
     preprocessMessage.textContent = "Could not restore previous job.";
+  }
+}
+
+async function resumeFtwJob() {
+  if (!activeFtwJobId) {
+    return;
+  }
+  try {
+    const response = await fetch(`/ftw/jobs/${activeFtwJobId}`);
+    const job = await response.json();
+    if (!response.ok) {
+      window.localStorage.removeItem("samGeoFtwJobId");
+      activeFtwJobId = "";
+      return;
+    }
+    renderFtwJob(job);
+    if (!isTerminalJob(job.status)) {
+      pollFtwJob();
+    }
+  } catch (error) {
+    ftwMessage.textContent = "Could not restore previous FTW job.";
   }
 }
 
@@ -255,6 +363,29 @@ function pollPreprocessJob() {
   }, 1200);
 }
 
+function pollFtwJob() {
+  window.clearTimeout(ftwPollTimer);
+  if (!activeFtwJobId) {
+    return;
+  }
+  ftwPollTimer = window.setTimeout(async () => {
+    try {
+      const response = await fetch(`/ftw/jobs/${activeFtwJobId}`);
+      const job = await response.json();
+      if (!response.ok) {
+        throw new Error(job.detail || "Failed to load FTW status.");
+      }
+      renderFtwJob(job);
+      if (!isTerminalJob(job.status)) {
+        pollFtwJob();
+      }
+    } catch (error) {
+      ftwMessage.textContent = error.message;
+      pollFtwJob();
+    }
+  }, 1600);
+}
+
 function renderPreprocessJob(job) {
   const percent = Math.round(Number(job.progress || 0) * 100);
   preprocessStatus.textContent = job.status;
@@ -275,9 +406,38 @@ function renderPreprocessJob(job) {
   }
 }
 
+function renderFtwJob(job) {
+  const percent = Math.round(Number(job.progress || 0) * 100);
+  ftwStatus.textContent = `${job.job_type || "ftw"} ${job.status}`;
+  ftwStage.textContent = job.stage || job.status;
+  ftwPercent.textContent = `${percent}%`;
+  ftwBar.style.width = `${percent}%`;
+  ftwMessage.textContent = `${job.current}/${job.total} ${job.message || ""}`.trim();
+  ftwJobId.textContent = job.job_id ? `job: ${job.job_id}` : "";
+  const running = !isTerminalJob(job.status);
+  cancelFtwButton.disabled = !running;
+  startFtwDownloadButton.disabled = running;
+  renderOutputsInto(ftwOutputs, job.output_paths || {});
+  renderLogsInto(ftwLogs, job.logs || [], job.error);
+  if (isTerminalJob(job.status)) {
+    window.clearTimeout(ftwPollTimer);
+    if (job.status === "completed") {
+      showToast("FTW job completed.");
+    }
+  }
+}
+
 function renderPreprocessOutputs(outputs) {
+  renderOutputsInto(preprocessOutputs, outputs);
+}
+
+function renderPreprocessLogs(logs, error) {
+  renderLogsInto(preprocessLogs, logs, error);
+}
+
+function renderOutputsInto(container, outputs) {
   const entries = Object.entries(outputs);
-  preprocessOutputs.innerHTML = "";
+  container.innerHTML = "";
   entries.forEach(([key, value]) => {
     const row = document.createElement("div");
     const label = document.createElement("span");
@@ -285,22 +445,22 @@ function renderPreprocessOutputs(outputs) {
     label.textContent = key;
     path.textContent = value;
     row.append(label, path);
-    preprocessOutputs.append(row);
+    container.append(row);
   });
 }
 
-function renderPreprocessLogs(logs, error) {
-  preprocessLogs.innerHTML = "";
+function renderLogsInto(container, logs, error) {
+  container.innerHTML = "";
   logs.slice(-8).forEach((line) => {
     const row = document.createElement("div");
     row.textContent = line;
-    preprocessLogs.append(row);
+    container.append(row);
   });
   if (error) {
     const row = document.createElement("div");
     row.className = "error-line";
     row.textContent = error;
-    preprocessLogs.append(row);
+    container.append(row);
   }
 }
 
@@ -309,22 +469,15 @@ function isTerminalJob(status) {
 }
 
 async function loadQaSamples() {
-  const datasetDir = datasetPathInput.value.trim();
-  if (!datasetDir) {
-    showToast("Enter a dataset path first.");
+  const params = buildQaParams();
+  if (!params) {
     return;
   }
-  const params = new URLSearchParams({
-    dataset_dir: datasetDir,
-    split: qaSplitInput.value,
-    mode: qaModeInput.value,
-    limit: qaLimitInput.value || "12",
-    seed: String(Date.now() % 1000000),
-  });
+  const endpoint = qaSourceInput.value === "ftw" ? "/ftw/preview" : "/preprocess/preview";
   loadQaButton.disabled = true;
   loadQaButton.textContent = "Loading";
   try {
-    const response = await fetch(`/preprocess/preview?${params.toString()}`);
+    const response = await fetch(`${endpoint}?${params.toString()}`);
     const payload = await response.json();
     if (!response.ok) {
       throw new Error(payload.detail || "Failed to load QA samples.");
@@ -344,6 +497,38 @@ async function loadQaSamples() {
     loadQaButton.disabled = false;
     loadQaButton.textContent = "Load samples";
   }
+}
+
+function buildQaParams() {
+  const seed = String(Date.now() % 1000000);
+  if (qaSourceInput.value === "ftw") {
+    const ftwRoot = ftwRootInput.value.trim();
+    if (!ftwRoot) {
+      showToast("Enter an FTW raw root first.");
+      return null;
+    }
+    return new URLSearchParams({
+      ftw_root: ftwRoot,
+      country: ftwPreviewCountryInput.value.trim() || "all",
+      window: ftwPreviewWindowInput.value,
+      mask_type: ftwPreviewMaskInput.value,
+      mode: qaModeInput.value,
+      limit: qaLimitInput.value || "12",
+      seed,
+    });
+  }
+  const datasetDir = datasetPathInput.value.trim();
+  if (!datasetDir) {
+    showToast("Enter a dataset path first.");
+    return null;
+  }
+  return new URLSearchParams({
+    dataset_dir: datasetDir,
+    split: qaSplitInput.value,
+    mode: qaModeInput.value,
+    limit: qaLimitInput.value || "12",
+    seed,
+  });
 }
 
 function showQaSample(index) {

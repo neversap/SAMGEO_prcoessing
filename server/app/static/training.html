@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SAM GEO Training</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <nav class="top-nav" aria-label="Primary navigation">
+        <a class="top-nav-link" href="/">Segmentation</a>
+        <a class="top-nav-link" href="/preprocess">Preprocess</a>
+        <a class="top-nav-link" href="/augmentation">Augmentation</a>
+        <a class="top-nav-link active" href="/training">Training</a>
+        <a class="top-nav-link" href="/inference">Inference</a>
+      </nav>
+
+      <section class="training-page">
+        <header class="training-hero">
+          <div class="brand">
+            <span class="brand-mark"></span>
+            <div>
+              <h1>FTW RGB Pretraining</h1>
+              <p>U-Net + EfficientNet-B3, RGB-only single-window, 3-class field boundary segmentation.</p>
+            </div>
+          </div>
+        </header>
+
+        <section class="training-plan-grid">
+          <article class="training-plan-card">
+            <span>Stage 0</span>
+            <h2>Sanity Check</h2>
+            <p>Use a small sample set to verify masks, dataloader output, loss decrease, and non-empty boundary predictions.</p>
+          </article>
+          <article class="training-plan-card">
+            <span>Stage 1</span>
+            <h2>Small Country Pretrain</h2>
+            <p>Train on a small set of countries to validate RGB-only FTW pretraining before full-scale compute.</p>
+          </article>
+          <article class="training-plan-card">
+            <span>Stage 2</span>
+            <h2>Full Pretrain</h2>
+            <p>Run multi-country training with bucket weighted sampling and save checkpoints by boundary F1.</p>
+          </article>
+          <article class="training-plan-card">
+            <span>Stage 3</span>
+            <h2>Loss Ablation</h2>
+            <p>Compare CE + Dice against PRUE-style weighted log-cosh Dice for boundary quality.</p>
+          </article>
+        </section>
+
+        <section class="training-deliverables">
+          <div class="panel-title">
+            <span>Expected Outputs</span>
+            <strong>pretraining package</strong>
+          </div>
+          <div class="training-deliverable-list">
+            <code>configs/pretrain/ftw_rgb_unet_effb3_pretrain_v1.yaml</code>
+            <code>metadata/train.csv, val.csv, test.csv, band_stats.json</code>
+            <code>outputs/.../checkpoints/best_val_boundary_f1.pt, best_val_miou.pt</code>
+            <code>outputs/.../reports/val_metrics.csv, qualitative_samples/</code>
+          </div>
+        </section>
+
+        <section class="training-runner">
+          <div class="panel-title">
+            <span>Run Training</span>
+            <strong id="trainingJobStatus">idle</strong>
+          </div>
+          <form id="trainingJobForm" class="preprocess-form">
+            <label class="field">
+              <span>Default data root</span>
+              <input type="text" value="/home/nvme1/datasets/ftw_datasets/data/ftw" readonly />
+            </label>
+            <label class="field">
+              <span>Dataset preset</span>
+              <select id="trainingDatasetPresetInput">
+                <option value="ftw">FTW pretrain</option>
+                <option value="inhouse">Inhouse finetune</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Loss preset</span>
+              <select id="trainingLossPresetInput">
+                <option value="baseline">CE + Dice baseline</option>
+                <option value="prue_logcosh">PRUE weighted log-cosh Dice</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Config</span>
+              <input id="trainingConfigInput" type="text" value="/app/configs/pretrain/ftw_rgb_unet_effb3_pretrain_v1.yaml" />
+            </label>
+            <label class="field">
+              <span>Init checkpoint</span>
+              <input id="trainingInitCheckpointInput" type="text" placeholder="/path/to/pretrain/checkpoints/best_val_miou.pt" />
+            </label>
+            <div class="field-grid">
+              <label class="field">
+                <span>Stage</span>
+                <select id="trainingStageInput">
+                  <option value="sanity_check">Sanity check</option>
+                  <option value="small_country_pretrain">Small country pretrain</option>
+                  <option value="full_pretrain">Full pretrain</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>Epoch override</span>
+                <input id="trainingEpochsInput" type="number" min="0" step="1" value="0" />
+              </label>
+            </div>
+            <div class="field-grid">
+              <label class="field">
+                <span>Batch override</span>
+                <input id="trainingBatchInput" type="number" min="0" step="1" value="0" />
+              </label>
+              <label class="field">
+                <span>Max train samples</span>
+                <input id="trainingMaxTrainInput" type="number" min="0" step="100" value="0" />
+              </label>
+            </div>
+            <label class="field">
+              <span>Max val samples</span>
+              <input id="trainingMaxValInput" type="number" min="0" step="100" value="0" />
+            </label>
+            <div class="preprocess-actions">
+              <button id="startTrainingButton" class="secondary-button" type="submit">Start training</button>
+              <button id="cancelTrainingButton" class="secondary-button" type="button" disabled>Cancel</button>
+            </div>
+          </form>
+          <div class="progress-box">
+            <div class="progress-header">
+              <span id="trainingJobStage">queued</span>
+              <strong id="trainingJobPercent">0%</strong>
+            </div>
+            <div class="progress-track">
+              <div id="trainingJobBar" class="progress-fill"></div>
+            </div>
+            <div id="trainingJobMessage" class="progress-message">No training job running.</div>
+            <code id="trainingJobId" class="job-id"></code>
+          </div>
+          <div id="trainingOutputs" class="outputs-list"></div>
+          <div id="trainingLogs" class="job-logs"></div>
+        </section>
+
+        <section class="training-dashboard">
+          <div class="panel-title">
+            <span>Training Dashboard</span>
+            <strong id="metricsStatus">waiting</strong>
+          </div>
+          <div class="metric-grid">
+            <figure class="metric-chart">
+              <canvas id="lossChart" width="640" height="360"></canvas>
+              <figcaption>Loss</figcaption>
+            </figure>
+            <figure class="metric-chart">
+              <canvas id="miouChart" width="640" height="360"></canvas>
+              <figcaption>Validation mIoU</figcaption>
+            </figure>
+            <figure class="metric-chart">
+              <canvas id="boundaryChart" width="640" height="360"></canvas>
+              <figcaption>Boundary F1</figcaption>
+            </figure>
+            <figure class="metric-chart">
+              <canvas id="lrChart" width="640" height="360"></canvas>
+              <figcaption>Learning Rate</figcaption>
+            </figure>
+          </div>
+        </section>
+      </section>
+    </main>
+    <div id="toast" class="toast hidden" role="status"></div>
+    <script src="/static/training_run.js"></script>
+  </body>
+</html>

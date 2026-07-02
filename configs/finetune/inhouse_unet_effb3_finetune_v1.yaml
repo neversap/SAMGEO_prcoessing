@@ -1,0 +1,111 @@
+experiment:
+  name: inhouse_unet_effb3_finetune_v1
+  seed: 42
+
+paths:
+  dataset_dir: /home/nvme1/datasets
+  metadata_csv: /home/nvme1/datasets/metadata/patch_index.csv
+  output_root: /home/nvme1/datasets/outputs/inhouse_unet_effb3_finetune_v1
+
+classes:
+  num_classes: 3
+  ignore_index: 255
+
+input:
+  image_scale: null
+  normalize: false
+  stats_mean: null
+  stats_std: null
+
+data:
+  source: inhouse
+  batch_size: 8
+  num_workers: 4
+  pin_memory: false
+  persistent_workers: false
+  prefetch_factor: 1
+  multiprocessing_context: spawn
+  gdal_cachemax_mb: 64
+  drop_last_train: true
+  max_train_samples: 0
+  max_val_samples: 0
+
+sampler:
+  enabled: true
+  bucket_weights:
+    boundary_rich: 3.0
+    low_fg: 1.5
+    mid_fg: 1.0
+    high_fg: 0.7
+    very_high_fg: 0.4
+    near_background: 0.3
+
+augmentation:
+  enabled: true
+  hflip: 0.5
+  vflip: 0.5
+  rotate90: 0.5
+  scale_jitter: 0.12
+  brightness: 0.10
+  contrast: 0.10
+  noise: 0.015
+
+model:
+  architecture: unet
+  encoder: efficientnet-b3
+  encoder_weights: null
+  in_channels: 3
+  num_classes: 3
+
+loss:
+  version: ce_dice_v1
+  class_weights: [0.05, 0.25, 0.70]
+  ce_weight: 1.0
+  dice_weight: 1.0
+  log_cosh_dice_weight: 0.0
+
+optimizer:
+  name: AdamW
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+
+scheduler:
+  name: cosine
+  warmup_epochs: 3
+  min_lr: 1.0e-6
+
+trainer:
+  device: cuda
+  cuda_visible_devices: "6,7"
+  data_parallel: false
+  epochs: 100
+  precision: amp
+  gradient_clip_val: 1.0
+  log_every_n_steps: 20
+  memory_log_every_n_steps: 50
+  save_top_k: 3
+  monitor: val_miou
+  monitor_mode: max
+
+checkpoint:
+  init_from: ""
+  strict: false
+  load_optimizer: false
+
+stage_overrides:
+  sanity_check:
+    trainer:
+      epochs: 5
+      memory_log_every_n_steps: 1
+      data_parallel: false
+    data:
+      batch_size: 4
+      num_workers: 4
+      pin_memory: false
+      persistent_workers: false
+      max_train_samples: 200
+      max_val_samples: 80
+  small_country_pretrain:
+    trainer:
+      epochs: 30
+  full_pretrain: {}

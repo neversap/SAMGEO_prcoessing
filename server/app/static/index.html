@@ -8,6 +8,14 @@
   </head>
   <body>
     <main class="app-shell">
+      <nav class="top-nav" aria-label="Primary navigation">
+        <a class="top-nav-link active" href="/">Segmentation</a>
+        <a class="top-nav-link" href="/preprocess">Preprocess</a>
+        <a class="top-nav-link" href="/augmentation">Augmentation</a>
+        <a class="top-nav-link" href="/training">Training</a>
+        <a class="top-nav-link" href="/inference">Inference</a>
+      </nav>
+
       <section class="workspace">
         <aside class="controls">
           <div class="brand">
@@ -89,7 +97,6 @@
             <span>Instances</span>
             <div id="instancesList" class="instances-list"></div>
           </div>
-          <a class="page-link" href="/preprocess">Data preprocess</a>
         </aside>
 
         <section class="viewer" aria-label="Segmentation preview">

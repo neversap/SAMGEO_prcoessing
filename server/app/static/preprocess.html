@@ -8,6 +8,14 @@
   </head>
   <body>
     <main class="app-shell">
+      <nav class="top-nav" aria-label="Primary navigation">
+        <a class="top-nav-link" href="/">Segmentation</a>
+        <a class="top-nav-link active" href="/preprocess">Preprocess</a>
+        <a class="top-nav-link" href="/augmentation">Augmentation</a>
+        <a class="top-nav-link" href="/training">Training</a>
+        <a class="top-nav-link" href="/inference">Inference</a>
+      </nav>
+
       <section class="workspace">
         <aside class="controls">
           <div class="brand">
@@ -17,8 +25,6 @@
               <p id="serviceStatus">Data preprocessing</p>
             </div>
           </div>
-
-          <a class="page-link" href="/">Segmentation page</a>
 
           <section class="preprocess-panel">
             <div class="panel-title">
@@ -112,11 +118,85 @@
             <div id="preprocessOutputs" class="outputs-list"></div>
             <div id="preprocessLogs" class="job-logs"></div>
 
+            <div class="ftw-panel">
+              <div class="panel-title">
+                <span>FTW Data</span>
+                <strong id="ftwStatus">idle</strong>
+              </div>
+              <form id="ftwDownloadForm" class="preprocess-form">
+                <label class="field">
+                  <span>FTW raw root</span>
+                  <input id="ftwRootInput" type="text" placeholder="/home/nvme1/datasets/ftw" />
+                </label>
+                <label class="field">
+                  <span>Countries</span>
+                  <input id="ftwCountriesInput" type="text" placeholder="Rwanda,France,Vietnam" />
+                </label>
+                <div class="field-grid">
+                  <label class="field">
+                    <span>FTW command</span>
+                    <input id="ftwCommandInput" type="text" value="ftw" />
+                  </label>
+                  <label class="field">
+                    <span>Extra args</span>
+                    <input id="ftwExtraArgsInput" type="text" placeholder="optional" />
+                  </label>
+                </div>
+                <button id="startFtwDownloadButton" class="secondary-button" type="submit">Download FTW</button>
+              </form>
+
+              <div class="field-grid">
+                <label class="field">
+                  <span>Preview country</span>
+                  <input id="ftwPreviewCountryInput" type="text" value="all" />
+                </label>
+                <label class="field">
+                  <span>Preview window</span>
+                  <select id="ftwPreviewWindowInput">
+                    <option value="window_a">Window A</option>
+                    <option value="window_b">Window B</option>
+                  </select>
+                </label>
+              </div>
+              <label class="field">
+                <span>Preview mask</span>
+                <select id="ftwPreviewMaskInput">
+                  <option value="semantic_3class">Semantic 3-class</option>
+                  <option value="semantic_2class">Semantic 2-class</option>
+                  <option value="instance">Instance</option>
+                </select>
+              </label>
+
+              <div class="preprocess-actions">
+                <button id="cancelFtwButton" class="secondary-button" type="button" disabled>Cancel FTW job</button>
+              </div>
+              <div class="progress-box">
+                <div class="progress-header">
+                  <span id="ftwStage">queued</span>
+                  <strong id="ftwPercent">0%</strong>
+                </div>
+                <div class="progress-track">
+                  <div id="ftwBar" class="progress-fill"></div>
+                </div>
+                <div id="ftwMessage" class="progress-message">No FTW job running.</div>
+                <code id="ftwJobId" class="job-id"></code>
+              </div>
+              <div id="ftwOutputs" class="outputs-list"></div>
+              <div id="ftwLogs" class="job-logs"></div>
+            </div>
+
             <div class="qa-panel">
               <div class="panel-title">
                 <span>Dataset QA</span>
                 <strong id="qaCounter">0/0</strong>
               </div>
+              <label class="field">
+                <span>Preview source</span>
+                <select id="qaSourceInput">
+                  <option value="inhouse">In-house processed</option>
+                  <option value="ftw">FTW official processed</option>
+                </select>
+              </label>
               <div class="field-grid">
                 <label class="field">
                   <span>Split</span>
